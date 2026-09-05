@@ -206,6 +206,32 @@ HTTP2_GATE_RB_RE = re.compile(
     + re.escape(SAND_HTTP2_GATE_RB_SUFFIX)
 )
 
+# 3.19.x 新增闸门：9909.js v() 先看 runtimeCapabilities.getPrivacyModeEnum()，不是
+# NO_STORAGE(1) / NO_TRAINING(2) / USAGE_DATA_TRAINING_ALLOWED(3) /
+# USAGE_CODEBASE_TRAINING_ALLOWED(4) 之一就返回 "privacy-mode-unavailable"（UI：Local loop
+# can't run this turn … could not resolve a usable privacy mode）；子代理 turn 与
+# backgroundTaskCompletionAction 唤醒走同一闸门（子代理 Stopped with error / Error resuming
+# chat）。4883.js 会话工厂的 resolvePrivacyMode 也要求该值非 undefined。
+# 渲染层 MEM_PRO 把会员改成 enterprise 后，workbench granularPrivacyModeRawEnum() 走团队分支
+# isTeamsPrivacyModeOn()：每 5 分钟重拉团队隐私模式，网络抖动全部失败时退回构造期默认
+# UNSPECIFIED(0)（Cursor 从不用成功结果更新 previousIsTeamPrivacyModeOn）。
+# 在 agent-host main.js 平台层（runtimeCapabilities 的唯一上游）兜底：合法值原样返回并记住，
+# 非法值回落到上次合法值，从未拿到过就用 Cursor 自身默认的 NO_STORAGE(1)。该值只影响本地
+# 数据脱敏策略，不进推理请求头。
+SAND_PRIVACY_MODE_MARKER = "/*SAND_PRIVACY_MODE_V1*/"
+PRIVACY_MODE_ENUM_RE = re.compile(
+    r"getPrivacyModeEnum\(\)\{return ([A-Za-z_$][\w$]*)\.cursor\.getPrivacyModeEnum\(\)\}"
+)
+_PRIVACY_MODE_FALLBACK_JS = (
+    "return _sandPm>=1&&_sandPm<=4?(this._sandPmLast=_sandPm):(this._sandPmLast||1)"
+)
+PRIVACY_MODE_ENUM_PATCHED_RE = re.compile(
+    r"getPrivacyModeEnum\(\)\{var _sandPm=([A-Za-z_$][\w$]*)\.cursor\.getPrivacyModeEnum\(\);"
+    + re.escape(_PRIVACY_MODE_FALLBACK_JS)
+    + re.escape(SAND_PRIVACY_MODE_MARKER)
+    + r"\}"
+)
+
 ACTION_GATE_ORIGINAL = '"userMessageAction"!==e.actionCase?"action-not-supported":'
 ACTION_GATE_PATCHED = (
     "!["
@@ -2795,6 +2821,25 @@ def apply_patch_to_content(
             _skip_http2_gate, next_content, count=1
         )
 
+    if (
+        SAND_PRIVACY_MODE_MARKER not in next_content
+        and "getPrivacyModeEnum(){return " in next_content
+    ):
+        def _fallback_privacy_mode(match: re.Match[str]) -> str:
+            stats.sand_rpc += 1
+            return (
+                "getPrivacyModeEnum(){var _sandPm="
+                + match.group(1)
+                + ".cursor.getPrivacyModeEnum();"
+                + _PRIVACY_MODE_FALLBACK_JS
+                + SAND_PRIVACY_MODE_MARKER
+                + "}"
+            )
+
+        next_content, _pm_n = PRIVACY_MODE_ENUM_RE.subn(
+            _fallback_privacy_mode, next_content, count=1
+        )
+
     if SAND_SUBAGENT_ROUTE_MARKER not in next_content:
         def _allow_subagent_run_options(match: re.Match[str]) -> str:
             stats.sand_rpc += 1
@@ -3102,6 +3147,18 @@ def remove_patch_from_content(content: str) -> Tuple[str, RemoveStats]:
     if residual_http2:
         next_content = next_content.replace(SAND_HTTP2_GATE_MARKER, "")
         stats.sand_rpc += residual_http2
+
+    next_content, pm_n = PRIVACY_MODE_ENUM_PATCHED_RE.subn(
+        lambda match: "getPrivacyModeEnum(){return "
+        + match.group(1)
+        + ".cursor.getPrivacyModeEnum()}",
+        next_content,
+    )
+    stats.sand_rpc += pm_n
+    residual_pm = next_content.count(SAND_PRIVACY_MODE_MARKER)
+    if residual_pm:
+        next_content = next_content.replace(SAND_PRIVACY_MODE_MARKER, "")
+        stats.sand_rpc += residual_pm
 
     next_content, local_model_rb_n = LOCAL_MODEL_RB_RE.subn(
         lambda match: "if(" + match.group(1) + ")" + match.group(2),
@@ -3449,6 +3506,7 @@ _ALL_SAND_MARKERS: Tuple[str, ...] = (
     SAND_RECONNECT_STREAM_MARKER,
     SAND_INTERACTION_ID_MARKER,
     SAND_HTTP2_GATE_MARKER,
+    SAND_PRIVACY_MODE_MARKER,
 )
 ALL_MARKERS_RE = _compile_all_markers_re()
 
@@ -3549,6 +3607,7 @@ def inspect_status(layout: CursorLayout) -> PatchStatus:
             + get(SAND_MAX_RETRIES_MARKER, 0)
             + get(SAND_INTERACTION_ID_MARKER, 0)
             + get(SAND_HTTP2_GATE_MARKER, 0)
+            + get(SAND_PRIVACY_MODE_MARKER, 0)
         )
         ctx_window_count = get(SAND_CTX_WINDOW_MARKER, 0)
         local_agent_count = get(SAND_BG_SUMMARY_MARKER, 0) + get(SAND_MODEL_INFO_MARKER, 0)

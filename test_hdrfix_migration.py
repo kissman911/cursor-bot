@@ -252,6 +252,41 @@ def test_318_http2_gate_roundtrip() -> None:
     assert restored == src
 
 
+def test_319_privacy_mode_fallback_roundtrip() -> None:
+    """3.19.x 9909.js 闸门要求 getPrivacyModeEnum() 是 1~4；会员伪装成 enterprise 后团队隐私
+    模式拉取失败会退回 UNSPECIFIED(0)，整个 turn 报 privacy-mode-unavailable。在 agent-host
+    main.js 平台层兜底，非法值回落到上次合法值 / NO_STORAGE。"""
+    src = (
+        "getTeamId(){return r.cursor.getTeamId()}"
+        "getPrivacyModeEnum(){return r.cursor.getPrivacyModeEnum()}"
+        "applyRequestHeaders(e,t,n){r.cursor.getAllRequestHeadersExceptAccessToken({req:e})}"
+    )
+    out, stats = apply_patch_to_content(src)
+    assert stats.sand_rpc >= 1
+    assert "/*SAND_PRIVACY_MODE_V1*/" in out
+    assert "getPrivacyModeEnum(){return r.cursor.getPrivacyModeEnum()}" not in out
+    assert (
+        "getPrivacyModeEnum(){var _sandPm=r.cursor.getPrivacyModeEnum();"
+        "return _sandPm>=1&&_sandPm<=4?(this._sandPmLast=_sandPm):(this._sandPmLast||1)"
+        "/*SAND_PRIVACY_MODE_V1*/}"
+    ) in out
+    # 周边方法原样保留
+    assert "getTeamId(){return r.cursor.getTeamId()}" in out
+    assert "applyRequestHeaders(e,t,n){r.cursor.getAllRequestHeadersExceptAccessToken({req:e})}" in out
+    again, _ = apply_patch_to_content(out)
+    assert again == out
+    restored, rst = remove_patch_from_content(out)
+    assert rst.sand_rpc >= 1
+    assert restored == src
+    # extHost / workbench 里的同名方法不走 .cursor.，不得误伤
+    other = (
+        "getPrivacyModeEnum(){return this.privacyModeEnum}"
+        "getPrivacyModeEnum:()=>$.getPrivacyModeEnum(),"
+    )
+    untouched, _ = apply_patch_to_content(other)
+    assert "/*SAND_PRIVACY_MODE_V1*/" not in untouched
+
+
 def test_478_mode_route_legacy_form_migrates() -> None:
     """2.2.2/2.2.3 装的是「仅放行 0/undefined」形态，重装应升级为 !1 形态，卸载也能还原。"""
     legacy = (
@@ -833,6 +868,7 @@ def test_live_3197_key_markers() -> None:
             "/*SAND_LOCAL_RUNTIME_LOAD_V1*/",
             "/*SAND_MOVE_EXEC_V1*/",
             "/*SAND_AGENT_HOST_IDENTITY_V1*/",
+            "/*SAND_PRIVACY_MODE_V1*/",
         ),
     }
     for path, markers in files.items():
@@ -891,6 +927,7 @@ def main() -> int:
         test_478_mode_route_roundtrip,
         test_478_mode_route_legacy_form_migrates,
         test_318_http2_gate_roundtrip,
+        test_319_privacy_mode_fallback_roundtrip,
         test_477_local_agent_config_roundtrip,
         test_477_ctx_window_roundtrip,
         test_retry_resilience_roundtrip,

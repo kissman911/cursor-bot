@@ -195,8 +195,19 @@ def test_317_model_route_roundtrip() -> None:
     assert "/*SAND_MODEL_ROUTE_V1*/" in out
     assert "!1/*SAND_MODEL_ROUTE_V1*/" in out
     assert 'e.modelId!==v.w?"model-not-supported":' in out
+    # 3.17.21 478.js：模拟消息闸门排在模型闸门之前，同样要置 !1 放行
+    assert stats.sand_rpc >= 1
+    assert (
+        "!1/*SAND_SIM_MSG_ROUTE_V1*//*SAND_SIM_MSG_ROUTE_RB:e.simulatedUserMessage*/"
+        '?"simulated-message-not-supported":'
+    ) in out
+    assert 'e.simulatedUserMessage?"simulated-message-not-supported":' not in out
+    assert out.count('"simulated-message-not-supported"') == 1
+    again, _ = apply_patch_to_content(out)
+    assert again == out
     restored, rst = remove_patch_from_content(out)
     assert rst.model_route == 1
+    assert rst.sand_rpc >= 1
     assert restored == src
 
 
@@ -219,11 +230,19 @@ def test_478_mode_route_roundtrip() -> None:
     assert '!["userMessageAction","subscriptionNotificationAction"' in out
     assert '"backgroundSubagentAction"].includes(e.actionCase)' in out
     assert out.count('"action-not-supported"') == 1
+    # 模拟消息闸门（尾部形态 `:void 0`）置 !1，原条件进 RB
+    assert stats.sand_rpc >= 3
+    assert "/*SAND_SIM_MSG_ROUTE_V1*/" in out
+    assert (
+        "!1/*SAND_SIM_MSG_ROUTE_V1*//*SAND_SIM_MSG_ROUTE_RB:e.simulatedUserMessage*/"
+        '?"simulated-message-not-supported":void 0'
+    ) in out
+    assert out.count('"simulated-message-not-supported"') == 1
     # 幂等：再打一次不重复注入
     again, _ = apply_patch_to_content(out)
     assert again == out
     restored, rst = remove_patch_from_content(out)
-    assert rst.sand_rpc >= 2
+    assert rst.sand_rpc >= 3
     assert restored == src
 
 
@@ -559,16 +578,29 @@ def test_318_managed_local_gate_ae() -> None:
 import re
 from pathlib import Path
 
-AGENT_HOST_DIST = Path(
-    r"D:\GongJu\cursor\resources\app\extensions\cursor-agent-host\dist"
-)
+
+def _live_app_root() -> "Path | None":
+    """本机 Cursor 的 resources/app：先看作者机器的固定路径，再走工具自身的自动检测。"""
+    fixed = Path(r"D:\GongJu\cursor\resources\app")
+    if fixed.is_dir():
+        return fixed
+    try:
+        from sand_patch import resolve_cursor_layout
+
+        return resolve_cursor_layout().app_root
+    except Exception:
+        return None
 
 
 def _find_bundle(marker: str) -> "Path | None":
     """按内容定位 bundle：3.17.21=477/478.js，3.18.25=675/61.js，3.19.7=4883/9909.js。"""
-    if not AGENT_HOST_DIST.is_dir():
+    app = _live_app_root()
+    if app is None:
         return None
-    for p in sorted(AGENT_HOST_DIST.glob("*.js"), key=lambda x: -x.stat().st_size):
+    dist = app / "extensions" / "cursor-agent-host" / "dist"
+    if not dist.is_dir():
+        return None
+    for p in sorted(dist.glob("*.js"), key=lambda x: -x.stat().st_size):
         if marker in p.read_text(encoding="utf-8", errors="replace"):
             return p
     return None
@@ -600,6 +632,8 @@ def test_live_478_memory_roundtrip() -> None:
         assert out.count('"mode-not-supported"') == 1
     assert "/*SAND_SUBAGENT_ROUTE_V1*/" in out
     assert "/*SAND_ACTION_ROUTE_V1*/" in out
+    assert "/*SAND_SIM_MSG_ROUTE_V1*/" in out
+    assert 'e.simulatedUserMessage?"simulated-message-not-supported":' not in out
     if 'e.modelId!==v.w?"model-not-supported":' in src:
         assert stats.model_route == 1
         assert "!1/*SAND_MODEL_ROUTE_V1*/" in out
@@ -608,6 +642,7 @@ def test_live_478_memory_roundtrip() -> None:
     assert "0!==e.requestedMode" not in again
     assert again.count("/*SAND_SUBAGENT_ROUTE_V1*/") == 1
     assert again.count("/*SAND_ACTION_ROUTE_V1*/") == 1
+    assert again.count("/*SAND_SIM_MSG_ROUTE_V1*/") == 1
     assert again.count("/*SAND_SUBAGENT_RETRY_V1*/") == 1
     assert again.count("/*SAND_INTERACTION_ID_V1*/") == 1
     assert "enableAgentRetries:!1}" not in again
@@ -707,10 +742,18 @@ def test_319_mode_hosted_iife_roundtrip() -> None:
         '?e.simulatedUserMessage?"simulated-message-not-supported":T(e,r):"mode-not-supported"'
     )
     out, stats = apply_patch_to_content(src)
-    assert stats.sand_rpc >= 2
+    assert stats.sand_rpc >= 3
     assert "!0/*SAND_MODE_ROUTE_V1*/" in out
     assert "/*SAND_ACTION_ROUTE_V1*/" in out
     assert "isHostedSubagentChild" in out
+    # 3.19.7 9909.js：模式闸门置 !0 后真值分支紧跟模拟消息闸门，必须一并置 !1，
+    # 否则 isSimulatedMsg 的 turn 仍 runtime:"fail"（Simulated user messages are not supported）
+    assert "/*SAND_SIM_MSG_ROUTE_V1*/" in out
+    assert (
+        "*/?!1/*SAND_SIM_MSG_ROUTE_V1*//*SAND_SIM_MSG_ROUTE_RB:e.simulatedUserMessage*/"
+        '?"simulated-message-not-supported":T(e,r):"mode-not-supported"'
+    ) in out
+    assert 'e.simulatedUserMessage?"simulated-message-not-supported":' not in out
     again, _ = apply_patch_to_content(out)
     assert again == out
     restored, _ = remove_patch_from_content(out)
@@ -835,9 +878,9 @@ def test_live_3197_key_markers() -> None:
     """本机 3.19.7：9909.js / 4883.js / agent-host main.js 干跑必须打上新闸门。"""
     import json
 
-    app = Path(r"D:\GongJu\cursor\resources\app")
-    product = app / "product.json"
-    if not product.is_file():
+    app = _live_app_root()
+    product = app / "product.json" if app is not None else None
+    if product is None or not product.is_file():
         print("skip: test_live_3197_key_markers (no Cursor install)")
         return
     version = json.loads(product.read_text(encoding="utf-8")).get("version", "")
@@ -849,6 +892,7 @@ def test_live_3197_key_markers() -> None:
         app / "extensions" / "cursor-agent-host" / "dist" / "9909.js": (
             "/*SAND_MANAGED_LOCAL_ROUTE_V1*/",
             "/*SAND_MODE_ROUTE_V1*/",
+            "/*SAND_SIM_MSG_ROUTE_V1*/",
             "/*SAND_SUBAGENT_ROUTE_V1*/",
             "/*SAND_HTTP2_GATE_V1*/",
             "/*SAND_ACTION_ROUTE_V1*/",
@@ -883,6 +927,7 @@ def test_live_3197_key_markers() -> None:
         if path.name == "9909.js":
             assert 'reason:"sand-client"' not in out
             assert "!0/*SAND_MODE_ROUTE_V1*/" in out
+            assert 'e.simulatedUserMessage?"simulated-message-not-supported":' not in out
         if path.name == "4883.js":
             assert "getTaskToolConfig:async(e,t)=>{" in out
             assert "taskToolProps:_sandTtp" not in out

@@ -131,6 +131,9 @@ SAND_SUBAGENT_ROUTE_RB_SUFFIX = "*/"
 SAND_MODE_ROUTE_MARKER = "/*SAND_MODE_ROUTE_V1*/"
 SAND_MODE_ROUTE_RB_PREFIX = "/*SAND_MODE_ROUTE_RB:"
 SAND_MODE_ROUTE_RB_SUFFIX = "*/"
+SAND_SIM_MSG_ROUTE_MARKER = "/*SAND_SIM_MSG_ROUTE_V1*/"
+SAND_SIM_MSG_ROUTE_RB_PREFIX = "/*SAND_SIM_MSG_ROUTE_RB:"
+SAND_SIM_MSG_ROUTE_RB_SUFFIX = "*/"
 SAND_CTX_WINDOW_MARKER = "/*SAND_CTX_WINDOW_V1*/"
 SAND_CTX_WINDOW_END_MARKER = "/*SAND_CTX_WINDOW_END_V1*/"
 SAND_ACTION_ROUTE_MARKER = "/*SAND_ACTION_ROUTE_V1*/"
@@ -1036,6 +1039,30 @@ MODE_ROUTE_LEGACY_RB_RE = re.compile(
     + r"(.*?)"
     + re.escape(SAND_MODE_ROUTE_RB_SUFFIX)
     + r'\?"mode-not-supported":'
+)
+# 模式闸门之后紧跟 `e.simulatedUserMessage?"simulated-message-not-supported":`：用户消息带
+# isSimulatedMsg（客户端自动生成的续跑 / 快捷动作 / 订阅通知 / 执行计划等）时整个 turn
+# 被踢出 managed-local（3.17/3.18 → connect 被 Sand 拒；3.19 → runtime:"fail"，UI 报
+# 「Local loop can't run this turn … Simulated user messages are not supported on the local
+# loop」）。本地循环运行时（477/675/9341.js）本身完整处理 isSimulatedMsg，且自己也会构造
+# 这类消息（后台任务完成、计划执行、目标续跑），这道闸门只是路由层的保守拒绝，与模式 /
+# 动作闸门同类，置 !1 放行，原条件进 RB。三个版本的闸门文本一致。
+SIM_MSG_GATE_ORIGINAL = 'e.simulatedUserMessage?"simulated-message-not-supported":'
+SIM_MSG_GATE_PATCHED = (
+    "!1"
+    + SAND_SIM_MSG_ROUTE_MARKER
+    + SAND_SIM_MSG_ROUTE_RB_PREFIX
+    + "e.simulatedUserMessage"
+    + SAND_SIM_MSG_ROUTE_RB_SUFFIX
+    + '?"simulated-message-not-supported":'
+)
+SIM_MSG_ROUTE_RB_RE = re.compile(
+    r"!1"
+    + re.escape(SAND_SIM_MSG_ROUTE_MARKER)
+    + re.escape(SAND_SIM_MSG_ROUTE_RB_PREFIX)
+    + r"(.*?)"
+    + re.escape(SAND_SIM_MSG_ROUTE_RB_SUFFIX)
+    + r'\?"simulated-message-not-supported":'
 )
 # 478.js 把子代理 turn 的 subagentTypeName / parentAgentToolCallId 算进
 # hasUnsupportedRunOptions，在 feature-gate 之前就改道 connect。只拿掉这两项，
@@ -2807,6 +2834,10 @@ def apply_patch_to_content(
         next_content = next_content.replace(ACTION_GATE_ORIGINAL, ACTION_GATE_PATCHED, 1)
         stats.sand_rpc += 1
 
+    if SAND_SIM_MSG_ROUTE_MARKER not in next_content and SIM_MSG_GATE_ORIGINAL in next_content:
+        next_content = next_content.replace(SIM_MSG_GATE_ORIGINAL, SIM_MSG_GATE_PATCHED, 1)
+        stats.sand_rpc += 1
+
     if SAND_HTTP2_GATE_MARKER not in next_content:
         def _skip_http2_gate(match: re.Match[str]) -> str:
             stats.sand_rpc += 1
@@ -3138,6 +3169,15 @@ def remove_patch_from_content(content: str) -> Tuple[str, RemoveStats]:
     if residual_action:
         next_content = next_content.replace(SAND_ACTION_ROUTE_MARKER, "")
         stats.sand_rpc += residual_action
+
+    next_content, sim_msg_rb_n = SIM_MSG_ROUTE_RB_RE.subn(
+        lambda match: match.group(1) + '?"simulated-message-not-supported":', next_content
+    )
+    stats.sand_rpc += sim_msg_rb_n
+    residual_sim_msg = next_content.count(SAND_SIM_MSG_ROUTE_MARKER)
+    if residual_sim_msg:
+        next_content = next_content.replace(SAND_SIM_MSG_ROUTE_MARKER, "")
+        stats.sand_rpc += residual_sim_msg
 
     next_content, http2_rb_n = HTTP2_GATE_RB_RE.subn(
         lambda match: match.group(1), next_content
@@ -3495,6 +3535,7 @@ _ALL_SAND_MARKERS: Tuple[str, ...] = (
     SAND_SELF_SUMMARY_MARKER,
     SAND_SUBAGENT_ROUTE_MARKER,
     SAND_MODE_ROUTE_MARKER,
+    SAND_SIM_MSG_ROUTE_MARKER,
     SAND_CTX_WINDOW_MARKER,
     SAND_CTX_WINDOW_END_MARKER,
     SAND_ACTION_ROUTE_MARKER,
@@ -3602,6 +3643,7 @@ def inspect_status(layout: CursorLayout) -> PatchStatus:
             + get(SAND_SELF_SUMMARY_MARKER, 0)
             + get(SAND_SUBAGENT_ROUTE_MARKER, 0)
             + get(SAND_MODE_ROUTE_MARKER, 0)
+            + get(SAND_SIM_MSG_ROUTE_MARKER, 0)
             + get(SAND_ACTION_ROUTE_MARKER, 0)
             + get(SAND_SUBAGENT_RETRY_MARKER, 0)
             + get(SAND_MAX_RETRIES_MARKER, 0)

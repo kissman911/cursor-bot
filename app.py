@@ -16,6 +16,7 @@ import webview
 
 import browser_login
 import elevate
+import grok_box
 import local_cursor
 import resolve
 import sand_patch
@@ -114,6 +115,7 @@ def _build_patch_status(layout: sand_patch.CursorLayout, st: sand_patch.PatchSta
         "eligibility": st.eligibility_markers + st.legacy_eligibility_markers,
         "stream": {
             "direct": st.direct_stream_markers,
+            "relay": st.grok_relay_markers,
             "identity": st.agent_host_identity_markers,
             "enable": st.agent_host_enablement_markers,
             "route": st.managed_local_route_markers,
@@ -123,6 +125,7 @@ def _build_patch_status(layout: sand_patch.CursorLayout, st: sand_patch.PatchSta
             "modelRoute": st.model_route_markers,
             "localModel": st.local_model_markers,
         },
+        "boxRelay": _box_relay_state(),
         "dns": {
             "hijacked": bool(dns.get("hijacked")),
             "hostsInstalled": bool(dns.get("hosts_installed")),
@@ -133,6 +136,16 @@ def _build_patch_status(layout: sand_patch.CursorLayout, st: sand_patch.PatchSta
         },
         "externalMarkers": st.external_marker_count,
     }
+
+
+def _box_relay_state() -> dict:
+    """grok-box-relay.json 的状态 + 一行摘要（与 patch_status.bat 的 box_relay 行同值）。"""
+    info = grok_box.descriptor_status()
+    text, tone = sand_patch.box_relay_status_line()
+    info["summary"] = sand_patch.box_relay_summary()
+    info["text"] = text
+    info["tone"] = _ANSI_TONE.get(tone, "info")
+    return info
 
 
 def _run_patch_worker_action(action: str) -> None:
@@ -157,7 +170,7 @@ def run_patch_worker(action: str, result_path: Path) -> int:
     payload: dict
     try:
         _run_patch_worker_action(action)
-        payload = {"ok": True}
+        payload = {"ok": True, "warnings": list(sand_patch.last_install_warnings)}
     except sand_patch.SandToolError as exc:
         payload = {"ok": False, "error": str(exc)}
     except PermissionError as exc:
@@ -395,6 +408,9 @@ class Api:
                 result["written"] = True
                 return result
 
+        # Box 网关票按账号发：先给新账号 mint 好再启动 Cursor，否则第一条 Sand 消息会走上一个号的 Box。
+        box_relay = self._provision_box_after_switch(layout, jwt)
+
         try:
             started = bool(sand_patch.start_cursor(layout))
         except Exception:
@@ -403,6 +419,7 @@ class Api:
             return {
                 "ok": False,
                 "written": True,
+                "boxRelay": box_relay,
                 "error": "登录态已写入，但 Cursor 未能自动启动，请手动打开 Cursor",
             }
         return {
@@ -412,6 +429,7 @@ class Api:
             "resetMachineId": bool(reset_machine_id),
             "hasRefresh": bool(refresh_token),
             "machineIdFileWritten": machine_id_file_written,
+            "boxRelay": box_relay,
             "started": True,
             # 刚写完库就启动 Cursor，此刻读库可能失败；直接用已写入的 user_id 标记 active。
             "accounts": _annotate_accounts(self._store.list(), active_id=user_id),
@@ -549,7 +567,7 @@ class Api:
             return elevate.run_elevated_patch_worker(action)
         try:
             _run_patch_worker_action(action)
-            return {"ok": True}
+            return {"ok": True, "warnings": list(sand_patch.last_install_warnings)}
         except sand_patch.SandToolError as exc:
             return {"ok": False, "error": str(exc)}
         except PermissionError as exc:
@@ -578,6 +596,9 @@ class Api:
                 res.setdefault("lines", [])
                 res["verdict"] = "INCOMPLETE"
                 res["lines"].append({"text": f"状态复检失败：{exc}", "tone": "warn"})
+            # install 里 Box 网关接入失败不阻断补丁，但原因要显示出来。
+            for warning in res.get("warnings") or []:
+                res["lines"].append({"text": str(warning), "tone": "warn"})
         else:
             res.setdefault("hint", self._PATCH_FAIL_HINT)
         return res
@@ -587,6 +608,44 @@ class Api:
 
     def restore_patch(self) -> dict:
         return self._patch_with_banner("uninstall")
+
+    # ---- Grok Bot Box 网关（3.19.13 起 Sand 流量必须经账号自己的云端 Box 代转）----
+
+    def box_relay_status(self) -> dict:
+        try:
+            return {"ok": True, **_box_relay_state()}
+        except Exception as exc:
+            return {"ok": False, "error": str(exc)}
+
+    def provision_box_relay(self) -> dict:
+        """用本机 Cursor 当前登录账号申请 Box 网关票并确认 relay 路由；不需要管理员，不改 Cursor 文件。"""
+        try:
+            result = grok_box.provision_box_relay()
+        except grok_box.GrokBoxError as exc:
+            return {"ok": False, "error": str(exc), "boxRelay": _box_relay_state()}
+        except Exception as exc:
+            return {"ok": False, "error": str(exc)}
+        return {"ok": True, "result": result, "boxRelay": _box_relay_state()}
+
+    def _provision_box_after_switch(self, layout: sand_patch.CursorLayout, access_token: str) -> dict | None:
+        """切号后把 Box 网关描述符换成新账号的（补丁装了 relay 才做）。失败不影响切号本身。"""
+        try:
+            if sand_patch.inspect_status(layout).grok_relay_markers < 1:
+                return None
+        except Exception:
+            return None
+        machine_id = ""
+        try:
+            _token, machine_id = grok_box.read_cursor_login()
+        except grok_box.GrokBoxError:
+            pass
+        try:
+            result = grok_box.provision_box_relay(access_token=access_token, machine_id=machine_id)
+        except grok_box.GrokBoxError as exc:
+            return {"ok": False, "error": str(exc)}
+        except Exception as exc:
+            return {"ok": False, "error": str(exc)}
+        return {"ok": True, "result": result}
 
     def apply_dns_fix(self) -> dict:
         """仅写入系统 hosts（DoH IP）；完整打补丁时会一并安装。"""

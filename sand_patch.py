@@ -4,6 +4,7 @@
 命令行运行：
     python "Sand客户端模式安装工具.py" install
     python "Sand客户端模式安装工具.py" uninstall
+    python "Sand客户端模式安装工具.py" provision-box
     python "Sand客户端模式安装工具.py" set-path <Cursor路径|auto>
 """
 
@@ -28,6 +29,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple, Union
 
+import grok_box
 from dns_fix import (
     DNS_NODE_TARGETS,
     SAND_DNS_FIX_MARKER,
@@ -40,7 +42,7 @@ from dns_fix import (
 )
 
 
-TOOL_VERSION = "2.3.5"
+TOOL_VERSION = "2.4.0"
 CONFIG_VERSION = 1
 
 SAND_CLIENT_MARKER = "/*SAND_CLIENT_MODE_V1*/"
@@ -146,6 +148,9 @@ SAND_SUBAGENT_RETRY_MARKER = "/*SAND_SUBAGENT_RETRY_V1*/"
 SAND_MAX_RETRIES_MARKER = "/*SAND_MAX_RETRIES_V1*/"
 SAND_RECONNECT_STREAM_MARKER = "/*SAND_RECONNECT_STREAM_V1*/"
 SAND_INTERACTION_ID_MARKER = "/*SAND_INTERACTION_ID_V1*/"
+# 与 SandClaimer 1.4.2 / sand_stream_installer v1.3.5 同名：两边互认对方注入的 relay 块，
+# apply 会原地换成本工具的版本，uninstall 两代都能拆。
+SAND_GROK_RELAY_MARKER = "/*SAND_GROK_BOX_RELAY_AUTH_V1*/"
 
 # 网络抖动韧性（2.2.6，3.17.21 日志实测）：
 # - 478 子代理执行器给子 turn 写死 enableAgentRetries:!1 → 一次 socket hang up 子代理就死，
@@ -579,6 +584,9 @@ BR_RESOURCE_GET_PATCHED = (
 # 3.17.21：打开 agent_host_local_loop 加载 477.js，
 # 并绕过 478.js 路由白名单 + 477.js Doe()「Unsupported managed local model」，
 # 否则 UI 会 Connection Error（根本走不到 InferenceService）。
+# 2026-09-09 起（Cursor 3.19.13 / Grok Bot 0.44.0）：服务端不再接受 sand 身份直连
+# api2 的 InferenceService/Stream（401 ERROR_NOT_LOGGED_IN）。Stream 必须经该账号的
+# Grok Bot 云端 Box 网关代转，见 grok_box.py 与下方 GROK_RELAY_* 注入。
 PATCH_CLIENT_TYPE = "sand"
 SAND_CLIENT_VERSION = "0.18.0"
 SAND_BOX_NAMESPACE = "prod"
@@ -588,6 +596,7 @@ STREAM_CURSOR_VERSIONS: Tuple[str, ...] = (
     "3.18.9",
     "3.18.25",
     "3.19.7",
+    "3.19.13",
 )
 STREAM_CURSOR_VERSION = STREAM_CURSOR_VERSIONS[-1]
 
@@ -680,11 +689,13 @@ TARGET_SPECS: Tuple[Tuple[str, Optional[str]], ...] = (
     ("extensions/cursor-agent-host/dist/675.js", None),
     ("extensions/cursor-agent-host/dist/478.js", None),
     ("extensions/cursor-agent-host/dist/477.js", None),
-    # 3.18.25：478.js 重打包为 61.js；3.19.7 再改为 9909.js / 4883.js。
+    # 3.18.25：478.js 重打包为 61.js；3.19.7 再改为 9909.js / 4883.js；
+    # 3.19.13 路由并进 main.js，推理会话收进 4884.js。
     # layout_from_path 仍会扫描 agent-host/dist/*.js，这里只列常见历史名。
     ("extensions/cursor-agent-host/dist/61.js", None),
     ("extensions/cursor-agent-host/dist/9909.js", None),
     ("extensions/cursor-agent-host/dist/4883.js", None),
+    ("extensions/cursor-agent-host/dist/4884.js", None),
     (
         "out/vs/code/electron-utility/alwaysLocalSingleton/alwaysLocalSingletonMain.js",
         None,
@@ -751,6 +762,7 @@ class PatchStats:
     sand_rpc: int = 0
     ctx_window: int = 0
     local_agent: int = 0
+    grok_relay: int = 0
 
     @property
     def total(self) -> int:
@@ -776,6 +788,7 @@ class PatchStats:
             + self.agent_host_identity
             + self.dns_node
             + self.feature_flags
+            + self.grok_relay
         )
 
 
@@ -797,6 +810,7 @@ class RemoveStats:
     sand_rpc: int = 0
     ctx_window: int = 0
     local_agent: int = 0
+    grok_relay: int = 0
 
     @property
     def total(self) -> int:
@@ -817,6 +831,7 @@ class RemoveStats:
             + self.agent_host_identity
             + self.dns_node
             + self.feature_flags
+            + self.grok_relay
         )
 
 
@@ -847,6 +862,7 @@ class PatchStatus:
     membership_markers: int = 0
     hdrfix_v2_markers: int = 0
     renderer_unlock_markers: int = 0
+    grok_relay_markers: int = 0
     cursor_version: str = ""
     dns_hosts_installed: bool = False
     dns_hijacked: bool = False
@@ -875,6 +891,7 @@ class PatchStatus:
             + self.membership_markers
             + self.hdrfix_v2_markers
             + self.renderer_unlock_markers
+            + self.grok_relay_markers
             > 0
         )
 
@@ -889,6 +906,9 @@ class PatchStatus:
             self.agent_host_enablement_markers > 0
             and self.agent_host_identity_markers > 0
         )
+        # 3.19.x：Stream 直连 api2 已被服务端拒（9/9 起），必须同时有 Box relay 改道。
+        if _cursor_needs_direct_stream(self.cursor_version) and self.grok_relay_markers < 1:
+            return False
         if self.direct_stream_markers > 0:
             return (
                 identity_ok
@@ -1159,8 +1179,120 @@ DIRECT_STREAM_ANCHORS: Tuple[str, ...] = (
     "function gre(e){return t=>{return n=this,o=void 0,s=function*(){",
     # 3.19.7 4883.js：原生 ve() 握手走 e.runInference（服务端拒 sand）。
     "function ve(e){return t=>{return n=this,r=void 0,s=function*(){",
+    # 3.19.13 4884.js：同一函数改名 me()，函数体与 3.19.7 一致。
+    "function me(e){return t=>{return n=this,r=void 0,s=function*(){",
 )
 DIRECT_STREAM_ANCHOR = DIRECT_STREAM_ANCHORS[0]
+# 3.19.x 会话工厂的形状（名字每次打包都变）：命中后再看函数体是否真的走 e.runInference。
+DIRECT_STREAM_319_SHAPE_RE = re.compile(
+    r"function [A-Za-z_$][\w$]*\(e\)\{return t=>\{return n=this,r=void 0,s=function\*\(\)\{"
+)
+
+# Grok Bot Box relay 改道（2.4.0，对齐 SandClaimer 1.4.2 grok_box.py 的自刷新版）。
+# 锚点 = Connect TransportFactory.applyAuthorization 方法头：
+#   applyAuthorization(e,t){return <awaiter>(this,void 0,void 0,function*(){var <逗号变量>;if(t.overrideAuthToken){
+# 3.19.13 的 cursor-agent-host/dist/main.js 与 cursor-always-local/dist/main.js 各一处，只差 var 顺序；
+# 3.18.x 在 657.js / 61.js。awaiter 名与 var 序都泛化，块本身只用 e/t 与 Node 内建，两处通用。
+# 只拦 aiserver.v1.InferenceService/Stream：读 grok-box-relay.json，把 URL 改到 Box 网关的
+# relay 路由、Authorization 换 Box 票、带上描述符 headers（x-anyrun-network-token）与 Grok Bot 0.44 身份；
+# 票快过期（JWT exp 不足 2 分钟，或距 mintedAtMs 超过 refreshAfterMs）就用描述符 refresh 里的
+# Cursor 票自己再调 EnsureSandBox，成功则回写文件。其他 RPC 原样走后面的原逻辑。
+# 注意：x-cursor-client-type 用 String("sand") 而非裸字面量，避开本文件里各条 header.set 正则。
+GROK_RELAY_AUTH_APPLY_RE = re.compile(
+    r"applyAuthorization\(e,t\)\{return [A-Za-z_$][\w$]*\(this,void 0,void 0,function\*\(\)\{"
+    r"var [A-Za-z_$][\w$]*(?:,[A-Za-z_$][\w$]*)*;"
+    r"(?=if\(t\.overrideAuthToken\)\{)"
+)
+GROK_RELAY_AUTH_REMOVE_RE = re.compile(
+    re.escape(SAND_GROK_RELAY_MARKER) + r"[\s\S]*?return\}(?=if\(t\.overrideAuthToken\)\{)"
+)
+GROK_RELAY_AUTH_BLOCK = (
+    SAND_GROK_RELAY_MARKER
+    + 'const __sandGrokStream=e?.service?.typeName==="aiserver.v1.InferenceService"'
+    '&&e?.method?.name==="Stream";'
+    "if(__sandGrokStream){"
+    'const __sandFs=require("node:fs"),__sandPath=require("node:path"),'
+    '__sandOs=require("node:os"),__sandHttps=require("node:https");'
+    'const __sandRelayConfigPath=process.env.SAND_GROK_BOX_RELAY_CONFIG||('
+    'process.platform==="win32"?'
+    '__sandPath.join(process.env.LOCALAPPDATA||process.env.APPDATA||'
+    '__sandPath.join(__sandOs.homedir(),"AppData","Local"),'
+    '"SandClientModeStream","sand-client-cli","grok-box-relay.json"):'
+    '__sandPath.join(__sandOs.homedir(),'
+    'process.platform==="darwin"?"Library/Application Support":".config",'
+    '"SandClientModeStream","sand-client-cli","grok-box-relay.json"));'
+    'let __sandCfg=JSON.parse(__sandFs.readFileSync(__sandRelayConfigPath,"utf8"));'
+    'const __sandExp=t=>{try{const p=String(t).split(".");if(3!==p.length)return 0;'
+    'const j=JSON.parse(Buffer.from(p[1],"base64url").toString("utf8"));'
+    'return"number"==typeof j.exp?1e3*j.exp:0}catch(_){return 0}};'
+    'const __sandNeed=c=>{if(!c||!c.refresh||!c.refresh.accessToken||!c.refresh.backendUrl)return!1;'
+    'if(!c.token)return!0;const x=__sandExp(c.token);'
+    'if(x)return x-Date.now()<12e4;'
+    'return Date.now()-(c.mintedAtMs||0)>(c.refreshAfterMs||36e5)};'
+    'const __sandSum=m=>{const ep=Math.floor(Date.now()/1e6),'
+    'b=new Uint8Array([ep>>40&255,ep>>32&255,ep>>24&255,ep>>16&255,ep>>8&255,255&ep]);'
+    'let pv=165;for(let i=0;i<b.length;i++)b[i]=(b[i]^pv)+i%256&255,pv=b[i];'
+    'return Buffer.from(b).toString("base64url")+String(m||"")};'
+    'const __sandRV=(buf,o)=>{let r=0n,s=0n;for(;;){const y=buf[o++];'
+    'r|=BigInt(127&y)<<s;if(!(128&y))return[r,o];s+=7n}};'
+    'const __sandBox=buf=>{let o=0,url="",tok="",net="";while(o<buf.length){'
+    'let k;[k,o]=__sandRV(buf,o);const f=Number(k>>3n),w=Number(7n&k);'
+    'if(0===w){let v;[v,o]=__sandRV(buf,o)}else if(2===w){let l;[l,o]=__sandRV(buf,o);'
+    'const n=Number(l),g=buf.subarray(o,o+n);o+=n;'
+    '10===f?url=g.toString("utf8"):11===f?tok=g.toString("utf8"):4===f&&(net=g.toString("utf8"))}'
+    'else if(1===w)o+=8;else{if(5!==w)break;o+=4}}return{url,tok,net}};'
+    'const __sandMint=r=>new Promise((res,rej)=>{'
+    'const u=new URL("/aiserver.v1.GrokBotService/EnsureSandBox",r.backendUrl),'
+    'body=Buffer.from([16,1]),'
+    'rq=__sandHttps.request(u,{method:"POST",headers:{'
+    'authorization:"Bearer "+r.accessToken,"connect-protocol-version":"1",'
+    '"content-type":"application/proto","x-cursor-checksum":__sandSum(r.machineId),'
+    '"x-cursor-client-type":"sand","x-cursor-client-version":"0.44.0",'
+    '"x-sand-box-namespace":"prod","x-ghost-mode":"true","content-length":body.length}},'
+    'rp=>{const ch=[];rp.on("data",d=>ch.push(d));rp.on("end",()=>{'
+    '200!==rp.statusCode?rej(new Error("EnsureSandBox HTTP "+rp.statusCode)):'
+    '(()=>{try{res(__sandBox(Buffer.concat(ch)))}catch(err){rej(err)}})()})});'
+    'rq.on("error",rej);rq.write(body);rq.end()});'
+    'if(__sandNeed(__sandCfg))try{const nb=yield __sandMint(__sandCfg.refresh);'
+    'if(nb.url&&nb.tok){__sandCfg.baseUrl=nb.url,__sandCfg.token=nb.tok,'
+    '__sandCfg.headers=__sandCfg.headers||{},nb.net&&(__sandCfg.headers["x-anyrun-network-token"]=nb.net),'
+    '__sandCfg.mintedAtMs=Date.now();'
+    'try{__sandFs.writeFileSync(__sandRelayConfigPath,JSON.stringify(__sandCfg),{mode:384})}catch(_){}}}catch(_){}'
+    'if(!__sandCfg?.baseUrl||!__sandCfg?.token)throw new Error('
+    '"[SAND_GROK_BOX_RELAY_CONFIG_INVALID] Grok Bot gateway descriptor is missing");'
+    'e.url=new URL(__sandCfg.relayPath||'
+    '"/sand-stream-relay/aiserver.v1.InferenceService/Stream",'
+    '__sandCfg.baseUrl).toString();'
+    'e.header.set("Authorization",`Bearer ${__sandCfg.token}`);'
+    'for(const[__sandHeader,__sandValue]of Object.entries('
+    '__sandCfg.headers||{}))"string"==typeof __sandValue&&'
+    '__sandValue.length&&e.header.set(__sandHeader,__sandValue);'
+    'e.header.set("x-cursor-client-type",String("sand")),'
+    'e.header.set("x-cursor-client-source","sand-desktop"),'
+    'e.header.set("x-cursor-client-version","0.44.0"),'
+    'e.header.set("x-sand-box-namespace","prod");return}'
+)
+
+
+def _strip_grok_relay_auth(content: str) -> Tuple[str, int]:
+    if SAND_GROK_RELAY_MARKER not in content:
+        return content, 0
+    next_content, count = GROK_RELAY_AUTH_REMOVE_RE.subn("", content)
+    residual = next_content.count(SAND_GROK_RELAY_MARKER)
+    if residual:
+        next_content = next_content.replace(SAND_GROK_RELAY_MARKER, "")
+    return next_content, count + residual
+
+
+def _inject_grok_relay_auth(content: str) -> Tuple[str, int]:
+    """两处 applyAuthorization 各插一份 relay 块；已有的（含其他工具的同名旧版）先拆再按本版重打。"""
+    if "applyAuthorization(e,t)" not in content:
+        return content, 0
+    next_content, _stripped = _strip_grok_relay_auth(content)
+    next_content, count = GROK_RELAY_AUTH_APPLY_RE.subn(
+        lambda match: match.group(0) + GROK_RELAY_AUTH_BLOCK, next_content
+    )
+    return next_content, count
 ENABLE_AGENT_RETRIES_318_RE = re.compile(
     r"subagentModelOverrides:\[\],enableAgentRetries:"
     r"null!==\(([A-Za-z_$][A-Za-z0-9_$]*)=null==([A-Za-z_$][A-Za-z0-9_$]*)"
@@ -1337,6 +1469,16 @@ def _find_direct_stream_anchor(content: str) -> Optional[str]:
     for anchor in DIRECT_STREAM_ANCHORS:
         if anchor in content:
             return anchor
+    # 3.19.x：函数名随打包变（ve / me / …），按形状找，并确认函数体确实走 e.runInference 握手
+    # （只看到下一个同形函数之前，最多 1500 字符）。
+    if _is_319_stream_session_factory(content):
+        matches = list(DIRECT_STREAM_319_SHAPE_RE.finditer(content))
+        for index, match in enumerate(matches):
+            end = match.end() + 1500
+            if index + 1 < len(matches):
+                end = min(end, matches[index + 1].start())
+            if "e.runInference(" in content[match.end() : end]:
+                return match.group(0)
     return None
 
 
@@ -2971,6 +3113,9 @@ def apply_patch_to_content(
         )
         stats.direct_stream += 1
 
+    next_content, relay_n = _inject_grok_relay_auth(next_content)
+    stats.grok_relay += relay_n
+
     if SAND_AGENT_HOST_ENABLEMENT_MARKER not in next_content:
         def enable_agent_host(match: re.Match[str]) -> str:
             variable = match.group(2)
@@ -3014,7 +3159,10 @@ def apply_patch_to_content(
 
 def remove_patch_from_content(content: str) -> Tuple[str, RemoveStats]:
     stats = RemoveStats()
-    next_content = _strip_injected_extra_headers(content)
+    # relay 块里也有 header.set("x-cursor-client-version"/"x-sand-box-namespace")，先整块拆掉，
+    # 再跑下面的 header 正则。
+    next_content, stats.grok_relay = _strip_grok_relay_auth(content)
+    next_content = _strip_injected_extra_headers(next_content)
     next_content = _strip_orphan_hdrfix_after_paren(next_content)
 
     ver_rb_re = re.compile(
@@ -3548,6 +3696,7 @@ _ALL_SAND_MARKERS: Tuple[str, ...] = (
     SAND_INTERACTION_ID_MARKER,
     SAND_HTTP2_GATE_MARKER,
     SAND_PRIVACY_MODE_MARKER,
+    SAND_GROK_RELAY_MARKER,
 )
 ALL_MARKERS_RE = _compile_all_markers_re()
 
@@ -3607,6 +3756,7 @@ def inspect_status(layout: CursorLayout) -> PatchStatus:
     membership_markers = 0
     hdrfix_v2_markers = 0
     renderer_unlock_markers = 0
+    grok_relay_markers = 0
     external_sand_matches = 0
     external_marker_count = 0
     patched_files: List[Path] = []
@@ -3614,6 +3764,7 @@ def inspect_status(layout: CursorLayout) -> PatchStatus:
         content = _read_js_cached(target)
         marker_counts = _count_markers(content)
         get = marker_counts.get
+        grok_relay_count = get(SAND_GROK_RELAY_MARKER, 0)
         client_count = (
             get(SAND_CLIENT_MARKER, 0)
             + get(SAND_CLIENT_EXISTING_MARKER, 0)
@@ -3707,8 +3858,10 @@ def inspect_status(layout: CursorLayout) -> PatchStatus:
             + membership_count
             + hdrfix_v2_count
             + renderer_unlock_count
+            + grok_relay_count
         ):
             patched_files.append(target)
+        grok_relay_markers += grok_relay_count
         client_markers += client_count
         eligibility_markers += eligibility_count
         legacy_client_markers += legacy_client_count
@@ -3763,6 +3916,7 @@ def inspect_status(layout: CursorLayout) -> PatchStatus:
         membership_markers=membership_markers,
         hdrfix_v2_markers=hdrfix_v2_markers,
         renderer_unlock_markers=renderer_unlock_markers,
+        grok_relay_markers=grok_relay_markers,
         cursor_version=layout.version,
         dns_hosts_installed=bool(dns_diag.get("hosts_installed")),
         dns_hijacked=bool(dns_diag.get("hijacked")),
@@ -4149,6 +4303,7 @@ def _build_install_plan(
         total.sand_rpc += stats.sand_rpc
         total.ctx_window += stats.ctx_window
         total.local_agent += stats.local_agent
+        total.grok_relay += stats.grok_relay
     if plan:
         _update_extension_hashes(layout, plan)
         _sync_product_checksums(layout, plan)
@@ -4189,6 +4344,7 @@ def _build_uninstall_plan(
         total.sand_rpc += stats.sand_rpc
         total.ctx_window += stats.ctx_window
         total.local_agent += stats.local_agent
+        total.grok_relay += stats.grok_relay
     if plan:
         _update_extension_hashes(layout, plan)
         _sync_product_checksums(layout, plan)
@@ -4262,6 +4418,23 @@ def _mac_seal(layout: CursorLayout) -> None:
             pass
 
 
+# install() 里 Box 网关接入失败不阻断打补丁（换号后会重新接入），但要让 CLI / GUI 看到原因。
+last_install_warnings: List[str] = []
+
+
+def _prepare_box_relay(log: Optional[grok_box.Logger] = None) -> Optional[str]:
+    """local 模式：用本机 Cursor 登录票 mint Box 网关描述符并确认 relay 路由。返回告警文案或 None。"""
+    try:
+        result = grok_box.provision_box_relay(log=log)
+    except grok_box.GrokBoxError as exc:
+        return f"Box 网关未就绪，Sand 对话暂不可用：{exc}。切到有 Grok Bot 资格的账号或运行 provision-box 重试"
+    except Exception as exc:
+        return f"Box 网关接入异常：{exc}"
+    if result == "provisioning":
+        return "Box 仍在后台安装 relay 路由（未等到探活 200），就绪后自动生效；几分钟后可运行 provision-box 复查"
+    return None
+
+
 def install(layout: CursorLayout) -> int:
     before = inspect_status(layout)
     if before.external_marker_count:
@@ -4269,9 +4442,15 @@ def install(layout: CursorLayout) -> int:
             "检测到其他 Sand 模式标记，本脚本不会接管或覆盖它；"
             "请先用原安装方式卸载"
         )
+    last_install_warnings.clear()
+    mode = get_patch_mode()
     plan, _stats = _build_install_plan(layout)
     if not plan:
         if before.installed:
+            if mode == PATCH_MODE_LOCAL:
+                warning = _prepare_box_relay()
+                if warning:
+                    last_install_warnings.append(warning)
             _with_cursor_restarted(layout, _install_dns_hosts)
             _drop_legacy_full_loop_key()
             return 0
@@ -4283,8 +4462,13 @@ def install(layout: CursorLayout) -> int:
             "请先用管理员权限点「修复 DNS」，或用管理员运行本工具。"
         )
 
+    # 先接 Box 网关再关 Cursor：EnsureSandBox / Box 路由安装可能要等几分钟，期间 Cursor 照常可用。
+    if mode == PATCH_MODE_LOCAL:
+        warning = _prepare_box_relay()
+        if warning:
+            last_install_warnings.append(warning)
+
     changed_extensions = _planned_extension_names(layout, plan)
-    mode = get_patch_mode()
 
     def validate_server_mode(status: PatchStatus) -> None:
         # server 模式：sand 身份 + AgentService→ide 分流 + 会员伪装；不得残留 local 回路注入。
@@ -4292,6 +4476,7 @@ def install(layout: CursorLayout) -> int:
             "route": status.managed_local_route_markers,
             "runtime": status.local_runtime_load_markers,
             "direct": status.direct_stream_markers,
+            "relay": status.grok_relay_markers,
             "move_exec": status.move_exec_markers,
             "modelRoute": status.model_route_markers,
             "localModel": status.local_model_markers,
@@ -4352,7 +4537,8 @@ def install(layout: CursorLayout) -> int:
                 f"move_exec={status.move_exec_markers} "
                 f"model={status.model_route_markers} "
                 f"local_model={status.local_model_markers} "
-                f"direct={status.direct_stream_markers}"
+                f"direct={status.direct_stream_markers} "
+                f"relay={status.grok_relay_markers}"
                 "（可能是 Cursor 版本锚点变化，请反馈版本号）"
             )
         _verify_extension_hashes(layout, changed_extensions)
@@ -4387,6 +4573,7 @@ def uninstall(layout: CursorLayout) -> int:
     plan, _stats = _build_uninstall_plan(layout)
     if not plan:
         _remove_dns_hosts()
+        grok_box.remove_descriptor()
         _drop_legacy_full_loop_key()
         start_cursor(layout)
         return 0
@@ -4410,6 +4597,8 @@ def uninstall(layout: CursorLayout) -> int:
         _mac_seal(layout)
 
     _with_cursor_restarted(layout, apply)
+    # 描述符里有 Cursor 登录票（refresh 块），卸载后不留在盘上。
+    grok_box.remove_descriptor()
     _drop_legacy_full_loop_key()
     return 0
 
@@ -4441,6 +4630,7 @@ def build_parser() -> argparse.ArgumentParser:
             "示例：\n"
             "  python \"Sand客户端模式安装工具.py\" install\n"
             "  python \"Sand客户端模式安装工具.py\" uninstall\n"
+            "  python \"Sand客户端模式安装工具.py\" provision-box\n"
             "  python \"Sand客户端模式安装工具.py\" set-path \"E:\\Development\\IDE\\cursor\"\n"
             "  python3 \"Sand客户端模式安装工具.py\" set-path /Applications/Cursor.app\n"
             "  python \"Sand客户端模式安装工具.py\" set-path auto"
@@ -4448,8 +4638,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--version", action="version", version=f"%(prog)s {TOOL_VERSION}")
     commands = parser.add_subparsers(dest="command", required=True)
-    commands.add_parser("install", help="安装/注入 Sand 客户端模式")
+    commands.add_parser("install", help="安装/注入 Sand 客户端模式（local 模式会一并接入 Grok Bot Box 网关）")
     commands.add_parser("uninstall", help="卸载 Sand 客户端模式")
+    commands.add_parser(
+        "provision-box",
+        help="用本机 Cursor 登录账号接入 Grok Bot Box 网关（换号 / 票过期后重跑，无需重新 install）",
+    )
     set_path = commands.add_parser("set-path", help="设置 Cursor 路径；auto 恢复自动检测")
     set_path.add_argument(
         "path",
@@ -4461,6 +4655,48 @@ def build_parser() -> argparse.ArgumentParser:
     )
     set_mode.add_argument("mode", choices=list(PATCH_MODES))
     return parser
+
+
+def box_relay_summary() -> str:
+    """一行文字概括 grok-box-relay.json 的状态，供 status 报告 / GUI 复用。"""
+    info = grok_box.descriptor_status()
+    if not info.get("present"):
+        return "missing"
+    if not info.get("valid"):
+        return f"invalid ({info.get('error')})"
+    parts = ["ok"]
+    age = info.get("ageMinutes")
+    if age is not None:
+        parts.append(f"{age}min")
+    if info.get("accountMatches") is False:
+        parts.append("other-account")
+    if info.get("tokenExpired"):
+        parts.append("expired")
+    parts.append("self-refresh" if info.get("hasRefresh") else "no-refresh")
+    return " ".join(parts)
+
+
+def box_relay_status_line() -> Tuple[str, str]:
+    info = grok_box.descriptor_status()
+    if not info.get("present"):
+        return (
+            "Box 网关描述符缺失：Sand 对话会报 SAND_GROK_BOX_RELAY_CONFIG_INVALID，"
+            "请运行 provision-box（GUI：接入 Box 网关）",
+            ANSI_RED,
+        )
+    if not info.get("valid"):
+        return (f"Box 网关描述符无效：{info.get('error')}，请重新接入 Box 网关", ANSI_RED)
+    age = info.get("ageMinutes")
+    age_text = f"{age} 分钟前获取" if age is not None else "获取时间未知"
+    if info.get("accountMatches") is False:
+        return (
+            f"Box 网关描述符属于另一个账号（{age_text}）：切号后请重新接入 Box 网关，否则走错账号的额度",
+            ANSI_YELLOW,
+        )
+    if info.get("tokenExpired") and not info.get("hasRefresh"):
+        return (f"Box 网关票已过期且无法自刷新（{age_text}），请重新接入 Box 网关", ANSI_YELLOW)
+    refresh_text = "到期自动刷新" if info.get("hasRefresh") else "到期需手动重新接入"
+    return (f"Box 网关描述符就绪（{age_text}，{refresh_text}）", ANSI_GREEN)
 
 
 def collect_status_lines() -> List[Tuple[str, str]]:
@@ -4506,7 +4742,8 @@ def collect_status_lines() -> List[Tuple[str, str]]:
             if status.direct_stream_markers:
                 if layout.version.startswith("3.19"):
                     stream_msg = (
-                        "Stream 改道已启用（3.19.x 4883.js ve → InferenceService.Stream）"
+                        "Stream 改道已启用（3.19.x 会话工厂 → InferenceService.Stream，"
+                        f"经 Box relay {status.grok_relay_markers} 处）"
                     )
                 else:
                     stream_msg = (
@@ -4533,13 +4770,15 @@ def collect_status_lines() -> List[Tuple[str, str]]:
                 )
         else:
             hint = (
-                "3.19.x 必须 4883.js ve→Stream（direct>0），否则 sand 打 RunInference 被拒；"
+                "3.19.x 必须会话工厂→Stream（direct>0）且 applyAuthorization 走 Box relay（relay>0），"
+                "否则 sand 打 RunInference / 直连 api2 都被拒；"
                 "3.18.x 还需 gre/hre 或 local_loop + managed-local；"
                 "3.17.21 还需 local_loop + move_exec + 478 闸门 + 双白名单绕过"
             )
             lines.append(
                 (
                     f"Stream 改道不完整：direct={status.direct_stream_markers} "
+                    f"relay={status.grok_relay_markers} "
                     f"identity={status.agent_host_identity_markers} "
                     f"enable={status.agent_host_enablement_markers} "
                     f"route={status.managed_local_route_markers} "
@@ -4551,6 +4790,8 @@ def collect_status_lines() -> List[Tuple[str, str]]:
                     ANSI_YELLOW,
                 )
             )
+        if status.grok_relay_markers:
+            lines.append(box_relay_status_line())
     else:
         lines.append(("尚未安装 Sand 客户端模式", ANSI_YELLOW))
     dns_diag = diagnose_dns()
@@ -4638,6 +4879,8 @@ def status_report_rows(
         ("feature_flags", status.feature_flag_markers),
         ("client_markers", status.client_markers + status.legacy_client_markers),
         ("direct_stream", status.direct_stream_markers),
+        ("grok_relay", status.grok_relay_markers),
+        ("box_relay", box_relay_summary()),
         ("membership", status.membership_markers),
         ("hdrfix_v2", status.hdrfix_v2_markers),
         ("renderer_unlock", status.renderer_unlock_markers),
@@ -4662,6 +4905,7 @@ def status_verdict(status: PatchStatus, mode: Optional[str] = None) -> str:
             status.managed_local_route_markers
             + status.local_runtime_load_markers
             + status.direct_stream_markers
+            + status.grok_relay_markers
             + status.sand_rpc_markers
             + status.ctx_window_markers
             + status.local_agent_markers
@@ -4707,6 +4951,7 @@ def print_menu() -> None:
     print(colorize("  1", ANSI_BOLD, ANSI_GREEN) + ") 安装")
     print(colorize("  2", ANSI_BOLD, ANSI_GREEN) + ") 卸载")
     print(colorize("  3", ANSI_BOLD, ANSI_GREEN) + ") 设置 Cursor 路径")
+    print(colorize("  4", ANSI_BOLD, ANSI_GREEN) + ") 接入 Grok Bot Box 网关（换号 / 票过期后重跑）")
 
 
 def prompt_set_path() -> int:
@@ -4717,16 +4962,43 @@ def prompt_set_path() -> int:
         return apply_set_path(value)
 
 
+def provision_box_relay_cli() -> int:
+    def log(message: str) -> None:
+        print(colorize("  · " + message, ANSI_BLUE), flush=True)
+
+    try:
+        result = grok_box.provision_box_relay(log=log)
+    except grok_box.GrokBoxError as exc:
+        raise SandToolError(str(exc)) from exc
+    if result == "provisioning":
+        print_warn(
+            "Box 仍在后台安装 relay 路由（未等到探活 200）；就绪后 Cursor 自动可用，"
+            "几分钟后可重跑本命令确认（复用同一 agent，不重复扣费）。"
+        )
+    else:
+        print(colorize("Box 网关已就绪，Sand 对话经该账号的 Box relay 计费。", ANSI_GREEN))
+    return 0
+
+
+def _print_install_warnings() -> None:
+    for warning in last_install_warnings:
+        print_warn(warning)
+
+
 def run_choice(choice: str) -> Optional[int]:
     if choice == "1":
-        with LoadingSpinner("正在安装"):
-            return install(resolve_cursor_layout())
+        with LoadingSpinner("正在安装（含接入 Box 网关，可能需要几分钟）"):
+            code = install(resolve_cursor_layout())
+        _print_install_warnings()
+        return code
     if choice == "2":
         with LoadingSpinner("正在卸载"):
             return uninstall(resolve_cursor_layout())
     if choice == "3":
         return prompt_set_path()
-    print_warn("无效选项，请输入 1-3。")
+    if choice == "4":
+        return provision_box_relay_cli()
+    print_warn("无效选项，请输入 1-4。")
     return 0
 
 
@@ -4772,9 +5044,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             print_banner()
             return 0
 
+        if args.command == "provision-box":
+            code = provision_box_relay_cli()
+            print_banner()
+            return code
+
         layout = resolve_cursor_layout()
         if args.command == "install":
             code = install(layout)
+            _print_install_warnings()
             print_banner()
             return code
         if args.command == "uninstall":

@@ -550,7 +550,11 @@ async function confirmSwitch() {
   // 切号全程置 busy：表格按钮随 render 禁用，避免重复并发切号。
   busy = true;
   render();
-  toast(resetMid ? "正在切号并重置机器码，Cursor 将自动重启…" : "正在切号，Cursor 将自动重启…");
+  toast(
+    resetMid
+      ? "正在切号并重置机器码，Cursor 将自动重启（已打补丁时会先接入该账号的 Box 网关）…"
+      : "正在切号，Cursor 将自动重启（已打补丁时会先接入该账号的 Box 网关）…"
+  );
   try {
     const res = await api().switch_account(id, resetMid);
     if (res && res.ok) {
@@ -559,7 +563,11 @@ async function confirmSwitch() {
       if (res.resetMachineId) msg += "（已重置机器码）";
       if (res.machineIdFileWritten === false) msg += "，但 machineid 文件写入失败";
       if (res.hasRefresh === false) msg += "（无 refresh，token 过期后需重新切号）";
-      toast(msg, 4000);
+      const box = res.boxRelay;
+      if (box && box.ok === false) msg += `；Box 网关未接入：${box.error || "未知原因"}`;
+      else if (box && box.result === "provisioning") msg += "；Box 仍在后台安装 relay 路由，就绪后自动生效";
+      else if (box && box.ok) msg += "；已接入该账号的 Box 网关";
+      toast(msg, box && box.ok === false ? 8000 : 4000);
     } else {
       toast("切号失败：" + ((res && res.error) || "未知原因"), 4000);
     }
@@ -1032,7 +1040,7 @@ async function refreshPatch() {
   if (compat) {
     const versions = Array.isArray(res.supportedVersions) && res.supportedVersions.length
       ? res.supportedVersions.join(" / ")
-      : "3.17.21 / 3.18.9 / 3.18.25 / 3.19.7";
+      : "3.17.21 / 3.18.9 / 3.18.25 / 3.19.7 / 3.19.13";
     compat.textContent = `适配 Cursor ${versions}（按本机版本自动选锚点，旧版不卸）`;
   }
   const verLabel = $("appVersionLabel");
@@ -1047,8 +1055,13 @@ async function refreshPatch() {
     );
     if (!streamOk) {
       lines.push(
-        `<li class="warn">标记：route=${s.route || 0} runtime=${s.runtime || 0} moveExec=${s.moveExec || 0} execBridge=${s.execBridge || 0} direct=${s.direct || 0}</li>`
+        `<li class="warn">标记：route=${s.route || 0} runtime=${s.runtime || 0} moveExec=${s.moveExec || 0} execBridge=${s.execBridge || 0} direct=${s.direct || 0} relay=${s.relay || 0}</li>`
       );
+    }
+    // 3.19.13 起 Sand 流量经账号自己的 Grok Bot Box 网关代转；描述符状态与 print_banner 同一行文案。
+    const box = res.boxRelay;
+    if (Number(s.relay || 0) > 0 && box && box.text) {
+      lines.push(`<li class="${box.tone || "info"}">${esc(box.text)}</li>`);
     }
     if (ideLeft > 0) {
       lines.push(`<li class="warn">残留 IDE 匹配 ${ideLeft} 处（需重新打补丁）</li>`);
@@ -1079,6 +1092,9 @@ async function refreshPatch() {
   }
   const btnDns = $("btnDnsFix");
   if (btnDns) btnDns.disabled = !!(dns.hostsInstalled && !dns.hijacked);
+  // 没注入 relay 块时描述符无人消费，接入按钮没有意义。
+  const btnBox = $("btnBoxRelay");
+  if (btnBox) btnBox.disabled = !(installed && Number(s.relay || 0) > 0);
 }
 
 function setPatchBusy(busy) {
@@ -1086,6 +1102,8 @@ function setPatchBusy(busy) {
   $("btnRestore").disabled = busy;
   const btnDns = $("btnDnsFix");
   if (btnDns) btnDns.disabled = busy;
+  const btnBox = $("btnBoxRelay");
+  if (btnBox) btnBox.disabled = busy;
   const btnReport = $("btnPatchReport");
   if (btnReport) btnReport.disabled = busy;
 }
@@ -1139,9 +1157,22 @@ async function runPatchAction(call, startMsg, okMsg, failPrefix) {
 async function doPatch() {
   await runPatchAction(
     () => api().apply_patch(),
-    "正在打补丁（含 DNS + 工具调用链路），可能弹出 UAC…",
+    "正在打补丁（含 DNS + 接入 Grok Bot Box 网关，首次可能需要几分钟），可能弹出 UAC…",
     (res) => (res.verdict === "OK" ? "补丁完成，请完全退出后重开 Cursor 再对话" : "补丁已写入但状态不完整，请查看补丁情况"),
     "打补丁失败："
+  );
+}
+
+async function doBoxRelay() {
+  const bridge = api();
+  await runPatchAction(
+    () => (bridge.provision_box_relay ? bridge.provision_box_relay() : Promise.resolve({ ok: false, error: "当前版本不支持" })),
+    "正在用当前 Cursor 登录账号接入 Grok Bot Box 网关（Box 首次安装 relay 路由可能需要几分钟）…",
+    (res) =>
+      res.result === "provisioning"
+        ? "Box 仍在后台安装 relay 路由，就绪后自动生效；几分钟后可再点一次确认"
+        : "Box 网关已就绪，Sand 对话经该账号的 Box 计费",
+    "接入 Box 网关失败："
   );
 }
 
@@ -1276,6 +1307,8 @@ async function boot() {
   $("btnRestore").addEventListener("click", doRestore);
   const btnDnsFix = $("btnDnsFix");
   if (btnDnsFix) btnDnsFix.addEventListener("click", doDnsFix);
+  const btnBoxRelay = $("btnBoxRelay");
+  if (btnBoxRelay) btnBoxRelay.addEventListener("click", doBoxRelay);
   $("btnSetPath").addEventListener("click", doSetPath);
   $("switchOk").addEventListener("click", confirmSwitch);
   $("detailRefresh").addEventListener("click", () => {

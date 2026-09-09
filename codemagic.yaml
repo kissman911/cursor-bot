@@ -9,7 +9,7 @@ workflows:
     environment:
       vars:
         APP_NAME: "Infinity"
-        APP_VERSION: "2.3.5"
+        APP_VERSION: "2.4.0"
     scripts:
       - name: 安装 Python 依赖（含 mac 的 pyobjc）
         script: |

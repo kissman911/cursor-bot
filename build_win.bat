@@ -15,7 +15,7 @@ rem   2. the output dir is kept between runs so Nuitka reuses its C cache
 rem   3. --lto=no avoids very slow link-time optimization; --jobs uses all cores
 rem   4. packages unused at runtime are excluded from compilation
 
-set VER=2.3.5
+set VER=2.4.0
 set WORK=C:\sandbuild
 set MODE=%~1
 set DO_DEPS=0

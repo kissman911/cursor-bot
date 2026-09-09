@@ -135,6 +135,147 @@ def test_direct_stream_3197_ve_anchor() -> None:
     assert restored == src
 
 
+_319_SESSION_FACTORY_PREFIX = (
+    "class J{constructor(e,t,n,o){this.client=e,this.requestedModel=t"
+    ",this.modelConfig=n,this.inferenceReason=o}"
+    "getSession(e){return 1}}"
+    "new o.Ycw(x);"
+)
+_319_RECONNECT_LITERAL = (
+    'retryLogTag:"managed_local_agent_retries",'
+    'reconnectEndpoint:"InferenceService.RunInference"'
+)
+
+
+def test_direct_stream_31913_me_anchor() -> None:
+    """3.19.13 4884.js：会话工厂从 ve 改名 me，函数体不变。"""
+    src = (
+        _319_SESSION_FACTORY_PREFIX
+        + "function me(e){return t=>{return n=this,r=void 0,s=function*(){const z=1;"
+        + _319_RECONNECT_LITERAL
+    )
+    out, stats = apply_patch_to_content(src)
+    assert stats.direct_stream == 1
+    assert "function me(e){return t=>{return n=this,r=void 0,s=function*(){{/*SAND_DIRECT_INFERENCE_STREAM_V1*/" in out
+    assert "new J(e,n,void 0,void 0).getSession()" in out
+    assert 'reconnectEndpoint:"InferenceService.Stream"/*SAND_RECONNECT_STREAM_V1*/' in out
+    again, _ = apply_patch_to_content(out)
+    assert again == out
+    restored, rst = remove_patch_from_content(out)
+    assert rst.direct_stream == 1
+    assert restored == src
+
+
+def test_direct_stream_319_shape_fallback() -> None:
+    """名字不在锚点表里也能按形状命中，但必须是走 e.runInference 握手的那一个。"""
+    decoy = "function xx(e){return t=>{return n=this,r=void 0,s=function*(){return 0}}}"
+    real = "function qq(e){return t=>{return n=this,r=void 0,s=function*(){const n=yield e.runInference(i);"
+    src = _319_SESSION_FACTORY_PREFIX + decoy + real + _319_RECONNECT_LITERAL
+    out, stats = apply_patch_to_content(src)
+    assert stats.direct_stream == 1
+    assert out.count("/*SAND_DIRECT_INFERENCE_STREAM_V1*/") == 1
+    assert "function xx(e){return t=>{return n=this,r=void 0,s=function*(){return 0}}}" in out
+    assert "function qq(e){return t=>{return n=this,r=void 0,s=function*(){{/*SAND_DIRECT_INFERENCE_STREAM_V1*/" in out
+    restored, _ = remove_patch_from_content(out)
+    assert restored == src
+    # 没有 class J / o.Ycw（不是 3.19 会话工厂 bundle）时形状兜底不生效。
+    out2, stats2 = apply_patch_to_content(real)
+    assert stats2.direct_stream == 0
+    assert out2 == real
+
+
+_RELAY_AUTH_AGENT_HOST = (
+    "applyAuthorization(e,t){return a(this,void 0,void 0,function*(){"
+    "var n,r,o,s,i,a,l,c,u,d,m,p;if(t.overrideAuthToken){const i=yield t.overrideAuthToken();}})}"
+)
+_RELAY_AUTH_ALWAYS_LOCAL = (
+    "applyAuthorization(e,t){return Xy(this,void 0,void 0,function*(){"
+    "var n,r,s,o,i,a,l,u,m,c,d,p;if(t.overrideAuthToken){return 1}})}"
+)
+
+
+def test_grok_relay_auth_roundtrip() -> None:
+    from sand_patch import GROK_RELAY_AUTH_BLOCK, SAND_GROK_RELAY_MARKER
+
+    src = "class A{" + _RELAY_AUTH_AGENT_HOST + "}class B{" + _RELAY_AUTH_ALWAYS_LOCAL + "}"
+    out, stats = apply_patch_to_content(src)
+    assert stats.grok_relay == 2
+    assert out.count(SAND_GROK_RELAY_MARKER) == 2
+    # 块紧贴 var 声明之后、原 if(t.overrideAuthToken){ 之前，原逻辑原样保留。
+    assert "var n,r,o,s,i,a,l,c,u,d,m,p;" + GROK_RELAY_AUTH_BLOCK + "if(t.overrideAuthToken){" in out
+    assert "var n,r,s,o,i,a,l,u,m,c,d,p;" + GROK_RELAY_AUTH_BLOCK + "if(t.overrideAuthToken){" in out
+    # 关键语义：只拦 InferenceService/Stream，改 URL 到 relay 路由、换 Box 票、带 Grok Bot 0.44 身份，票快过期自刷新。
+    assert 'e?.service?.typeName==="aiserver.v1.InferenceService"&&e?.method?.name==="Stream"' in out
+    assert '"/sand-stream-relay/aiserver.v1.InferenceService/Stream"' in out
+    assert "SandClientModeStream" in out and "grok-box-relay.json" in out
+    assert 'e.header.set("Authorization",`Bearer ${__sandCfg.token}`)' in out
+    assert 'e.header.set("x-cursor-client-source","sand-desktop")' in out
+    assert 'e.header.set("x-cursor-client-version","0.44.0")' in out
+    assert "/aiserver.v1.GrokBotService/EnsureSandBox" in out and "__sandMint" in out
+    # header.set 正则不得改写块里的 String("sand")，也不能往块里塞 HDRFIX/NSFIX marker。
+    assert out.count('e.header.set("x-cursor-client-type",String("sand"))') == 2
+    assert "/*SAND_HDRFIX_V1*/" not in out and "/*SAND_NSFIX_V1*/" not in out
+    again, again_stats = apply_patch_to_content(out)
+    assert again == out
+    assert again_stats.grok_relay == 2
+    restored, rst = remove_patch_from_content(out)
+    assert rst.grok_relay == 2
+    assert restored == src
+
+
+def test_grok_relay_auth_replaces_foreign_static_block() -> None:
+    """其他工具（installer v1.3.5 / SandClaimer 1.4.1）注入的同名静态块：apply 原地换成自刷新版，remove 能拆。"""
+    from sand_patch import SAND_GROK_RELAY_MARKER
+
+    foreign_block = (
+        SAND_GROK_RELAY_MARKER
+        + 'const __sandGrokStream=e?.service?.typeName==="aiserver.v1.InferenceService"&&e?.method?.name==="Stream";'
+        'if(__sandGrokStream){const __sandRelayFs=require("node:fs");'
+        'e.header.set("x-cursor-client-type",String("sand")),e.header.set("x-sand-box-namespace","prod");return}'
+    )
+    vanilla = "class A{" + _RELAY_AUTH_AGENT_HOST + "}"
+    foreign = vanilla.replace("var n,r,o,s,i,a,l,c,u,d,m,p;", "var n,r,o,s,i,a,l,c,u,d,m,p;" + foreign_block)
+    assert foreign != vanilla
+    out, stats = apply_patch_to_content(foreign)
+    assert stats.grok_relay == 1
+    assert "__sandRelayFs" not in out
+    assert "__sandMint" in out
+    assert out.count(SAND_GROK_RELAY_MARKER) == 1
+    restored, rst = remove_patch_from_content(foreign)
+    assert rst.grok_relay == 1
+    assert restored == vanilla
+
+
+def test_grok_relay_auth_skips_unrelated_files() -> None:
+    src = 'applyAuthorization(e){return 1}header.set("x-cursor-client-type","ide")'
+    out, stats = apply_patch_to_content(src)
+    assert stats.grok_relay == 0
+    assert "/*SAND_GROK_BOX_RELAY_AUTH_V1*/" not in out
+
+
+def test_319_stream_requires_relay_marker() -> None:
+    from sand_patch import PatchStatus
+
+    base = dict(
+        client_markers=1,
+        eligibility_markers=0,
+        ide_matches=0,
+        external_sand_matches=0,
+        external_marker_count=0,
+        legacy_client_markers=0,
+        legacy_eligibility_markers=0,
+        patched_files=(),
+        managed_local_route_markers=1,
+        direct_stream_markers=1,
+        agent_host_enablement_markers=1,
+        agent_host_identity_markers=1,
+    )
+    assert not PatchStatus(cursor_version="3.19.13", grok_relay_markers=0, **base).stream_mode_installed
+    assert PatchStatus(cursor_version="3.19.13", grok_relay_markers=2, **base).stream_mode_installed
+    # 3.18.x 不把 relay 当硬条件（旧版规则原样保留）。
+    assert PatchStatus(cursor_version="3.18.25", grok_relay_markers=0, **base).stream_mode_installed
+
+
 def test_317_local_loop_roundtrip() -> None:
     src = (
         'let t=!1;try{t=await n.cursor.checkFeatureGate(Mo)}catch(e){'
@@ -575,12 +716,21 @@ def test_318_managed_local_gate_ae() -> None:
     assert restored == src
 
 
+import os
 import re
 from pathlib import Path
 
 
 def _live_app_root() -> "Path | None":
-    """本机 Cursor 的 resources/app：先看作者机器的固定路径，再走工具自身的自动检测。"""
+    """本机 Cursor 的 resources/app：SAND_TEST_APP_ROOT 环境变量（如只读挂载的官方 dmg）优先，
+    再看作者机器的固定路径，最后走工具自身的自动检测。"""
+    override = os.environ.get("SAND_TEST_APP_ROOT", "").strip()
+    if override:
+        candidate = Path(override)
+        if (candidate / "product.json").is_file():
+            return candidate
+        if (candidate / "Contents" / "Resources" / "app" / "product.json").is_file():
+            return candidate / "Contents" / "Resources" / "app"
     fixed = Path(r"D:\GongJu\cursor\resources\app")
     if fixed.is_dir():
         return fixed
@@ -883,52 +1033,75 @@ def test_live_3197_key_markers() -> None:
     if product is None or not product.is_file():
         print("skip: test_live_3197_key_markers (no Cursor install)")
         return
-    version = json.loads(product.read_text(encoding="utf-8")).get("version", "")
-    if not str(version).startswith("3.19"):
+    version = str(json.loads(product.read_text(encoding="utf-8")).get("version", ""))
+    if not version.startswith("3.19"):
         print(f"skip: test_live_3197_key_markers (Cursor {version}, want 3.19.x)")
         return
 
-    files = {
-        app / "extensions" / "cursor-agent-host" / "dist" / "9909.js": (
-            "/*SAND_MANAGED_LOCAL_ROUTE_V1*/",
-            "/*SAND_MODE_ROUTE_V1*/",
-            "/*SAND_SIM_MSG_ROUTE_V1*/",
-            "/*SAND_SUBAGENT_ROUTE_V1*/",
-            "/*SAND_HTTP2_GATE_V1*/",
-            "/*SAND_ACTION_ROUTE_V1*/",
-            "/*SAND_INTERACTION_ID_V1*/",
-            "/*SAND_SUBAGENT_RETRY_V1*/",
-        ),
-        app / "extensions" / "cursor-agent-host" / "dist" / "4883.js": (
-            "/*SAND_AGENT_FLAGS_V1*/",
-            "/*SAND_TASK_TOOL_PROPS_V1*/",
-            "/*SAND_CTX_WINDOW_V1*/",
-            "/*SAND_BG_SUMMARY_V1*/",
-            "/*SAND_MAX_RETRIES_V1*/",
-            "/*SAND_DIRECT_INFERENCE_STREAM_V1*/",
-            "/*SAND_RECONNECT_STREAM_V1*/",
-        ),
-        app / "extensions" / "cursor-agent-host" / "dist" / "main.js": (
-            "/*SAND_LOCAL_RUNTIME_LOAD_V1*/",
-            "/*SAND_MOVE_EXEC_V1*/",
-            "/*SAND_AGENT_HOST_IDENTITY_V1*/",
-            "/*SAND_PRIVACY_MODE_V1*/",
-        ),
-    }
+    routing_markers = (
+        "/*SAND_MANAGED_LOCAL_ROUTE_V1*/",
+        "/*SAND_MODE_ROUTE_V1*/",
+        "/*SAND_SIM_MSG_ROUTE_V1*/",
+        "/*SAND_SUBAGENT_ROUTE_V1*/",
+        "/*SAND_HTTP2_GATE_V1*/",
+        "/*SAND_ACTION_ROUTE_V1*/",
+        "/*SAND_INTERACTION_ID_V1*/",
+        "/*SAND_SUBAGENT_RETRY_V1*/",
+    )
+    session_markers = (
+        "/*SAND_AGENT_FLAGS_V1*/",
+        "/*SAND_TASK_TOOL_PROPS_V1*/",
+        "/*SAND_CTX_WINDOW_V1*/",
+        "/*SAND_BG_SUMMARY_V1*/",
+        "/*SAND_MAX_RETRIES_V1*/",
+        "/*SAND_DIRECT_INFERENCE_STREAM_V1*/",
+        "/*SAND_RECONNECT_STREAM_V1*/",
+    )
+    host_markers = (
+        "/*SAND_LOCAL_RUNTIME_LOAD_V1*/",
+        "/*SAND_MOVE_EXEC_V1*/",
+        "/*SAND_AGENT_HOST_IDENTITY_V1*/",
+        "/*SAND_PRIVACY_MODE_V1*/",
+    )
+    relay_marker = ("/*SAND_GROK_BOX_RELAY_AUTH_V1*/",)
+    dist = app / "extensions" / "cursor-agent-host" / "dist"
+    always_local = app / "extensions" / "cursor-always-local" / "dist" / "main.js"
+    if version == "3.19.7":
+        # 路由 9909.js（TransportFactory 也在这里）、会话 4883.js。
+        files = {
+            dist / "9909.js": routing_markers + relay_marker,
+            dist / "4883.js": session_markers,
+            dist / "main.js": host_markers,
+            always_local: relay_marker,
+        }
+        routing_name, session_name = "9909.js", "4883.js"
+    else:
+        # 3.19.13：路由 / TransportFactory 并进 main.js，会话收进 4884.js。
+        files = {
+            dist / "main.js": routing_markers + host_markers + relay_marker,
+            dist / "4884.js": session_markers,
+            always_local: relay_marker,
+        }
+        routing_name, session_name = "main.js", "4884.js"
     for path, markers in files.items():
         if not path.is_file():
-            raise AssertionError(f"3.19.7 缺少 {path.name}")
+            raise AssertionError(f"{version} 缺少 {path.name}")
         src, _ = remove_patch_from_content(path.read_text(encoding="utf-8", errors="replace"))
+        if 'reason:"sand-client"' in src:
+            # 其他工具（installer / SandClaimer）的 managed-local 注入形状不同，本工具拆不干净，
+            # 拿它当基线没有意义；用 SAND_TEST_APP_ROOT 指向干净的官方包再跑。
+            print(f"skip: test_live_3197_key_markers ({path.name} 带其他工具的注入，非干净基线)")
+            return
         out, _stats = apply_patch_to_content(src)
         restored, _ = remove_patch_from_content(out)
         assert restored == src, path.name
         missing = [m for m in markers if m not in out]
         assert not missing, f"{path.name} 缺 marker: {missing}"
-        if path.name == "9909.js":
+        if path.name == routing_name and path.parent == dist:
             assert 'reason:"sand-client"' not in out
             assert "!0/*SAND_MODE_ROUTE_V1*/" in out
             assert 'e.simulatedUserMessage?"simulated-message-not-supported":' not in out
-        if path.name == "4883.js":
+        if path.name == session_name:
             assert "getTaskToolConfig:async(e,t)=>{" in out
             assert "taskToolProps:_sandTtp" not in out
             assert "new J(e,n,void 0,void 0).getSession()" in out
@@ -938,6 +1111,9 @@ def test_live_3197_key_markers() -> None:
             assert "e.runInference" not in out.split("/*SAND_DIRECT_INFERENCE_STREAM_V1*/", 1)[1][:400]
             assert 'reconnectEndpoint:"InferenceService.Stream"' in out
             assert 'reconnectEndpoint:"InferenceService.RunInference"' not in out
+        if "/*SAND_GROK_BOX_RELAY_AUTH_V1*/" in markers:
+            assert out.count("/*SAND_GROK_BOX_RELAY_AUTH_V1*/") == 1, path.name
+            assert "if(t.overrideAuthToken){" in out
 
 
 def test_dns_node_roundtrip() -> None:
@@ -1051,6 +1227,12 @@ def main() -> int:
         test_direct_stream_3189_anchor,
         test_direct_stream_skipped_on_317,
         test_direct_stream_3197_ve_anchor,
+        test_direct_stream_31913_me_anchor,
+        test_direct_stream_319_shape_fallback,
+        test_grok_relay_auth_roundtrip,
+        test_grok_relay_auth_replaces_foreign_static_block,
+        test_grok_relay_auth_skips_unrelated_files,
+        test_319_stream_requires_relay_marker,
         test_317_local_loop_roundtrip,
         test_318_local_runtime_roundtrip,
         test_317_move_exec_roundtrip,

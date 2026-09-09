@@ -2,13 +2,13 @@
 [Setup]
 AppId={{8E4C2A91-6B17-4F3D-9C58-7A1B2C3D4E5F}
 AppName=Infinity
-AppVersion=2.3.5
+AppVersion=2.4.0
 AppPublisher=Infinity
 DefaultDirName={autopf}\Infinity
 DefaultGroupName=Infinity
 DisableProgramGroupPage=yes
 OutputDir=installer
-OutputBaseFilename=Infinity-Setup-2.3.5
+OutputBaseFilename=Infinity-Setup-2.4.0
 SetupIconFile=icon.ico
 UninstallDisplayIcon={app}\SandClaimer.exe
 Compression=lzma2/max

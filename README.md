@@ -7,6 +7,7 @@
 ## 功能
 
 - **本机 Cursor 补丁**：打补丁 / 回退 / 「查看补丁情况」；路径留空自动检测，也可手填 `Cursor.exe` 或安装目录。非管理员运行时自动走 UAC 提权子进程。
+- **接入 Grok Bot Box 网关**：3.19.13 起 Sand 流量必须经账号自己的云端 Box 代转（见下文）。打补丁时自动接入当前登录账号；切号后自动换成新账号的 Box；票过期由注入的 JS 自刷新；也可单独点「接入 Box 网关」/ 运行 `python sand_patch.py provision-box`。
 - **修复 DNS**：本机开着 Clash 等 fake-ip 代理时，写 hosts 修好 Cursor 域名；另有 DoH 兜底解析（见 `resolve.py`）。
 - **两种 token 自动识别**：`access_token`（JWT，`eyJ...`）与 `ws token`（`user_01XXXX::eyJ...`，即 WorkosCursorSessionToken）。
 - **导入方式**：直接粘贴（每行一个，可混排）、粘贴 `cursor_accounts_*.json` 内容、「导入文件」选一个/多个 JSON、或「探测本机账号」把当前 Cursor 已登录的号加进来。按 user id 自动去重，账号持久化到 `%LOCALAPPDATA%\SandClaimer\accounts.json`。
@@ -38,9 +39,19 @@ build.bat
 产物：
 
 - `nuitka-out\SandClaimer.exe` —— 单文件绿色版，双击即用。
-- `installer\Infinity-Setup-2.3.3.exe` —— 中文安装向导，装到 Program Files 并建开始菜单 / 桌面快捷方式。
+- `installer\Infinity-Setup-2.4.0.exe` —— 中文安装向导，装到 Program Files 并建开始菜单 / 桌面快捷方式。
 
-本机补丁已适配 **Cursor 3.17.21 / 3.18.9 / 3.18.25 / 3.19.7**（按安装目录自动选锚点，旧版适配保留）。
+本机补丁已适配 **Cursor 3.17.21 / 3.18.9 / 3.18.25 / 3.19.7 / 3.19.13**（按安装目录自动选锚点，旧版适配保留）。
+
+### Grok Bot Box relay（2.4.0，Cursor 3.19.13 / Grok Bot 0.44.0 起必需）
+
+2026-09-09 起服务端不再接受「Cursor 登录票 + `sand` 身份」直连 `api2.cursor.sh` 的 `InferenceService/Stream`（回 `401 ERROR_NOT_LOGGED_IN` / `Sand traffic is not supported on this endpoint`），光改客户端身份已经没用。可行路线是让 Grok Bot 的**云端 Box** 代转，2.4.0 把这条链路做进了工具：
+
+1. `grok_box.py` 用本机 Cursor 登录票调 `aiserver.v1.GrokBotService/EnsureSandBox`，拿到该账号 Box 的网关地址 + 短期票，写到 `SandClientModeStream/sand-client-cli/grok-box-relay.json`（Windows 在 `%LOCALAPPDATA%`，macOS 在 `~/Library/Application Support`；与 cursor-sdk2api 的 `SAND_BOX_RELAY_SOURCE=file` 共用同一份文件）。Box 默认没有 relay 路由，首次会通过 Box 网关的 `/api/createAgent` + `/api/sendPrompt` 让 Box 内的 Agent 自己把 `/sand-stream-relay/aiserver.v1.InferenceService/Stream` 路由装到 `host-main.cjs`，然后轮询探活（首次可能要几分钟）。
+2. 补丁往 `cursor-agent-host` / `cursor-always-local` 两处 `TransportFactory.applyAuthorization` 各注入一段 `/*SAND_GROK_BOX_RELAY_AUTH_V1*/`：只拦 `InferenceService/Stream`，每次请求重读描述符，把 URL 改到 Box 网关的 relay 路由、`Authorization` 换成 Box 票，并带上 Grok Bot 0.44 的 `sand` 身份；票快过期时用描述符里的 Cursor 票自己再 mint 一次并回写文件，不用重启 Cursor。marker 与 SandClaimer 1.4.2 / sand_stream_installer 同名，能原地接管它们注入的旧版静态块。
+3. 3.19.13 的会话工厂从 4883.js 的 `ve()` 改名为 4884.js 的 `me()`，锚点已补上并加了按形状兜底；其余 3.19.7 规则在 3.19.13 上原样命中。
+
+Box 票按账号发，用哪个号的 Box 就扣哪个号的 Grok Bot 额度，所以「切号」会先给新账号接入 Box 再启动 Cursor。「查看补丁情况」里 `grok_relay` 是注入处数、`box_relay` 是描述符状态；描述符缺失时 Cursor 里的 Sand 对话会报 `SAND_GROK_BOX_RELAY_CONFIG_INVALID`，点「接入 Box 网关」即可。回退补丁会连描述符一起删（里面有 Cursor 登录票）。
 
 只想编译不打安装包时用 `build_win.bat`：默认出 onefile，`fast` 出 standalone 目录（跳过 onefile 打包，快），`deps` 先装依赖再编译。云端打包走 GitHub Actions（`.github/workflows/build.yml`）：推 `v*` tag 或在 Actions 页手动触发，同时产出 Windows 安装包和 macOS 的 Apple Silicon / Intel 两个 dmg，在该次运行的 Artifacts 里下载。macOS 的 `.app` 无法在 Windows 上交叉编译，也可改用 Codemagic（`codemagic.yaml`）。
 
@@ -73,6 +84,7 @@ build.bat
 | 账期消费 | POST | `cursor.com/api/dashboard/get-current-period-usage` | 会话 cookie + Origin |
 | 套餐名 | GET | `api2.cursor.sh/auth/full_stripe_profile` | Bearer accessToken |
 | 按模型花费 | POST | `api2.cursor.sh/aiserver.v1.DashboardService/GetAggregatedUsageEvents` | Bearer + `application/proto` |
+| 申请 Box 网关 | POST | `api2.cursor.sh/aiserver.v1.GrokBotService/EnsureSandBox` | Bearer + `application/proto` + Grok Bot 0.44 `sand` 身份头 |
 
 `cursor.com` 的 dashboard 系列即使是读也要带 Origin 过 CSRF，否则 403；`api2` 的一元接口必须用 `Content-Type: application/proto`，发 JSON 会 400/415。
 
@@ -106,6 +118,7 @@ Cusor-bot-sand/
 ├─ local_cursor.py       # 读写本机 Cursor 登录态（探测 / 切号）
 ├─ browser_login.py      # CDP 注入 cookie，打开已登录浏览器
 ├─ sand_patch.py         # 本机 Cursor 客户端模式补丁 / 回退
+├─ grok_box.py           # Grok Bot Box 网关：EnsureSandBox、relay 描述符、Box 路由 provision
 ├─ sand_rpc/             # InferenceService/Stream 的 Connect 客户端
 ├─ dns_fix.py            # hosts 修复（Clash fake-ip 等劫持）
 ├─ resolve.py            # DoH 绕过 DNS 劫持

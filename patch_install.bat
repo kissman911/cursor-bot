@@ -8,7 +8,7 @@ exit /b
 
 :run
 echo ========================================
-echo  Cursor Grok Bot patch install  v2.3.5
+echo  Cursor Grok Bot patch install  v2.4.0
 echo  mode: LOCAL (sand identity, local agent loop, one bill per step)
 echo ========================================
 echo.

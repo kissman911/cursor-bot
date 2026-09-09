@@ -15,7 +15,7 @@
         <img class="brand-icon" src="infinity-icon.png" width="36" height="36" alt="" />
         <div class="brand-text">
           <strong>Infinity</strong>
-          <span>INFINITY免费公益 · v<span id="appVersionLabel">2.3.5</span></span>
+          <span>INFINITY免费公益 · v<span id="appVersionLabel">2.4.0</span></span>
         </div>
       </div>
       <nav class="nav" aria-label="分区">
@@ -73,11 +73,12 @@
               <button class="btn primary" id="btnPatch">打补丁</button>
               <button class="btn ghost" id="btnRestore">回退</button>
               <button class="btn" id="btnDnsFix" title="仅修复 hosts DNS（Clash fake-ip 等）">修复 DNS</button>
+              <button class="btn" id="btnBoxRelay" title="用当前 Cursor 登录账号申请 Grok Bot Box 网关票并确认 relay 路由；换号 / 票过期后点，不需要重新打补丁">接入 Box 网关</button>
               <button class="btn" id="btnPatchReport" title="前半段与 patch_status.bat 输出逐行相同，后附引擎状态行">查看补丁情况</button>
             </div>
           </div>
           <p class="hint" id="patchInfo">正在检测本机 Cursor 安装…</p>
-          <p class="hint" id="patchCompat">适配 Cursor 3.17.21 / 3.18.9 / 3.18.25 / 3.19.7（按本机版本自动选锚点）</p>
+          <p class="hint" id="patchCompat">适配 Cursor 3.17.21 / 3.18.9 / 3.18.25 / 3.19.7 / 3.19.13（按本机版本自动选锚点）</p>
           <ul class="patch-detail" id="patchDetail" hidden></ul>
           <p class="hint patch-admin" id="patchAdminHint" hidden></p>
           <div class="row-actions">

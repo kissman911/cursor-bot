@@ -23,6 +23,8 @@ rows = [
     ("feature_flags", st.feature_flag_markers),
     ("client_markers", st.client_markers + st.legacy_client_markers),
     ("direct_stream", st.direct_stream_markers),
+    ("grok_relay", st.grok_relay_markers),
+    ("box_relay", s.box_relay_summary()),
     ("membership", st.membership_markers),
     ("hdrfix_v2", st.hdrfix_v2_markers),
     ("renderer_unlock", st.renderer_unlock_markers),

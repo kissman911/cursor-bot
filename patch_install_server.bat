@@ -8,7 +8,7 @@ exit /b
 
 :run
 echo ========================================
-echo  Cursor patch install  v2.3.5
+echo  Cursor patch install  v2.4.0
 echo  mode: SERVER (sand + AgentService ide, one bill per turn)
 echo ========================================
 echo.

@@ -3927,6 +3927,24 @@ def _mac_bundle_pids(layout: CursorLayout) -> List[int]:
     return pids
 
 
+def _mac_main_pids(layout: CursorLayout) -> List[int]:
+    """只认 Cursor.app/Contents/MacOS/Cursor，不把残留 Helper 当成已启动。"""
+    bundle = _find_app_bundle(layout.app_root)
+    if bundle is None:
+        return []
+    exe = (bundle / "Contents" / "MacOS" / "Cursor").resolve()
+    pids: List[int] = []
+    for pid, executable in _mac_process_paths(strict=False):
+        if pid == os.getpid():
+            continue
+        try:
+            if executable.resolve() == exe:
+                pids.append(pid)
+        except OSError:
+            continue
+    return pids
+
+
 def _wait_for_mac_exit(layout: CursorLayout, timeout_seconds: float) -> bool:
     deadline = time.monotonic() + timeout_seconds
     while time.monotonic() < deadline:
@@ -3934,6 +3952,23 @@ def _wait_for_mac_exit(layout: CursorLayout, timeout_seconds: float) -> bool:
             return True
         time.sleep(0.25)
     return not _mac_bundle_pids(layout)
+
+
+def _wait_for_mac_launch(
+    layout: CursorLayout,
+    timeout_seconds: float,
+    before: Optional[Set[int]] = None,
+) -> bool:
+    previous = set(before or ())
+    deadline = time.monotonic() + timeout_seconds
+    while time.monotonic() < deadline:
+        current = set(_mac_main_pids(layout)) - previous
+        if current:
+            time.sleep(0.8)
+            still = set(_mac_main_pids(layout)) - previous
+            return bool(still)
+        time.sleep(0.25)
+    return bool(set(_mac_main_pids(layout)) - previous)
 
 
 def _mac_close_cursor(layout: CursorLayout) -> int:
@@ -3990,6 +4025,26 @@ def close_cursor(layout: CursorLayout) -> int:
     raise SandToolError("当前仅支持 Windows 和 macOS")
 
 
+def _with_cursor_restarted(layout: CursorLayout, body) -> None:
+    """关 Cursor 干活；无论成功失败都再拉起来，避免补丁半截把 IDE 留在退出状态。"""
+    close_cursor(layout)
+    body_error: Optional[BaseException] = None
+    try:
+        body()
+        close_cursor(layout)
+    except BaseException as exc:
+        body_error = exc
+    if not start_cursor(layout):
+        start_error = SandToolError(
+            "未能重新打开 Cursor，请手动打开 /Applications/Cursor.app"
+        )
+        if body_error is not None:
+            raise start_error from body_error
+        raise start_error
+    if body_error is not None:
+        raise body_error
+
+
 # 启动参数：--classic 让 Cursor 直接进经典 IDE/编辑器窗口，跳过新版 Agents 中枢窗口。
 # （官方设置「Open Agents Window on startup / Window Restoration」有会循环回 Agents 窗口的已知 bug，
 #  --classic 启动参数是稳定绕过方式。）
@@ -4018,15 +4073,25 @@ def start_cursor(layout: CursorLayout) -> bool:
             bundle = _find_app_bundle(layout.app_root)
             if bundle is None:
                 return False
-            subprocess.run(
-                [shutil.which("open") or "/usr/bin/open", "-a", str(bundle), "--args", *CURSOR_START_ARGS],
+            # adhoc / spctl-rejected 的 Cursor.app 走 `open -a` 会弹 Gatekeeper 小框然后起不来。
+            # 直接拉 Contents/MacOS 里的可执行文件，不走 Apple Events。
+            exe = bundle / "Contents" / "MacOS" / "Cursor"
+            if not exe.is_file():
+                exe = Path(str(layout.executable))
+            if not exe.is_file():
+                return False
+            if _mac_bundle_pids(layout):
+                _mac_close_cursor(layout)
+            before_main = set(_mac_main_pids(layout))
+            subprocess.Popen(
+                [str(exe), *CURSOR_START_ARGS],
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
-                timeout=20,
-                check=False,
+                start_new_session=True,
+                cwd=str(Path.home()),
             )
-            return True
+            return _wait_for_mac_launch(layout, 8, before=before_main)
     except (OSError, subprocess.TimeoutExpired):
         return False
     return False
@@ -4134,6 +4199,10 @@ def _install_dns_hosts() -> None:
     try:
         install_hosts(TOOL_VERSION)
     except PermissionError as exc:
+        # 打补丁会先关 Cursor。hosts 已经写过时，无 root 再写一次不该拆掉已提交的 JS 补丁，
+        # 否则 Cursor 停在关闭状态，看起来像闪退。
+        if hosts_block_installed():
+            return
         raise SandToolError(
             f"无法写入系统 hosts 文件以修复 DNS 劫持：{exc}。"
             "请用管理员权限运行安装脚本。"
@@ -4203,14 +4272,17 @@ def install(layout: CursorLayout) -> int:
     plan, _stats = _build_install_plan(layout)
     if not plan:
         if before.installed:
-            close_cursor(layout)
-            _install_dns_hosts()
-            start_cursor(layout)
+            _with_cursor_restarted(layout, _install_dns_hosts)
             _drop_legacy_full_loop_key()
             return 0
         raise SandToolError("当前 Cursor 版本未匹配到 Sand 客户端模式规则")
 
-    close_cursor(layout)
+    if not hosts_block_installed() and not _hosts_writable():
+        raise SandToolError(
+            "无法写入系统 hosts 文件以修复 DNS 劫持。"
+            "请先用管理员权限点「修复 DNS」，或用管理员运行本工具。"
+        )
+
     changed_extensions = _planned_extension_names(layout, plan)
     mode = get_patch_mode()
 
@@ -4293,13 +4365,14 @@ def install(layout: CursorLayout) -> int:
                     f"检测到非法 Statsig 补丁残留，Cursor 将无法启动：{target}"
                 )
 
-    _commit_plan(layout, plan, "install", validate)
-    _install_dns_hosts()
-    if not hosts_block_installed():
-        raise SandToolError("安装后 DNS hosts 修复未生效，请用管理员权限重试")
-    _mac_seal(layout)
-    close_cursor(layout)
-    start_cursor(layout)
+    def apply() -> None:
+        _commit_plan(layout, plan, "install", validate)
+        _install_dns_hosts()
+        if not hosts_block_installed():
+            raise SandToolError("安装后 DNS hosts 修复未生效，请用管理员权限重试")
+        _mac_seal(layout)
+
+    _with_cursor_restarted(layout, apply)
     _drop_legacy_full_loop_key()
     return 0
 
@@ -4318,7 +4391,6 @@ def uninstall(layout: CursorLayout) -> int:
         start_cursor(layout)
         return 0
 
-    close_cursor(layout)
     changed_extensions = _planned_extension_names(layout, plan)
 
     def validate() -> None:
@@ -4332,13 +4404,26 @@ def uninstall(layout: CursorLayout) -> int:
         _verify_extension_hashes(layout, changed_extensions)
         _verify_product_checksums(layout)
 
-    _commit_plan(layout, plan, "uninstall", validate)
-    _remove_dns_hosts()
-    _mac_seal(layout)
-    close_cursor(layout)
-    start_cursor(layout)
+    def apply() -> None:
+        _commit_plan(layout, plan, "uninstall", validate)
+        _remove_dns_hosts()
+        _mac_seal(layout)
+
+    _with_cursor_restarted(layout, apply)
     _drop_legacy_full_loop_key()
     return 0
+
+
+def _hosts_writable() -> bool:
+    path = (
+        Path(r"C:\Windows\System32\drivers\etc\hosts")
+        if sys.platform == "win32"
+        else Path("/etc/hosts")
+    )
+    try:
+        return os.access(path, os.W_OK)
+    except OSError:
+        return False
 
 
 def _permission_hint() -> str:

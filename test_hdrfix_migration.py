@@ -947,9 +947,96 @@ def test_dns_node_roundtrip() -> None:
     out, pst = apply_dns_node_patch(src)
     assert pst == 1
     assert out.startswith(SAND_DNS_FIX_MARKER)
+    assert "agentn.global.api5.cursor.sh" in out
+    stale = out.replace("agentn.global.api5.cursor.sh", "stale.example")
+    refreshed, rst_refresh = apply_dns_node_patch(stale)
+    assert rst_refresh == 1
+    assert "agentn.global.api5.cursor.sh" in refreshed
     restored, rst = remove_dns_node_patch(out)
     assert rst == 1
     assert restored == src
+
+
+def test_hosts_permission_does_not_abort_when_block_exists() -> None:
+    """macOS 无 root 时写 /etc/hosts 会 PermissionError；hosts 已在就不该拆掉已提交的补丁。"""
+    import sand_patch as s
+
+    def boom(_tool_version: str) -> None:
+        raise PermissionError("Operation not permitted")
+
+    orig_install = s.install_hosts
+    orig_present = s.hosts_block_installed
+    s.install_hosts = boom  # type: ignore[method-assign]
+    s.hosts_block_installed = lambda: True  # type: ignore[method-assign]
+    try:
+        s._install_dns_hosts()
+    finally:
+        s.install_hosts = orig_install
+        s.hosts_block_installed = orig_present
+
+
+def test_hosts_permission_still_fails_when_block_missing() -> None:
+    import sand_patch as s
+
+    def boom(_tool_version: str) -> None:
+        raise PermissionError("Operation not permitted")
+
+    orig_install = s.install_hosts
+    orig_present = s.hosts_block_installed
+    s.install_hosts = boom  # type: ignore[method-assign]
+    s.hosts_block_installed = lambda: False  # type: ignore[method-assign]
+    try:
+        try:
+            s._install_dns_hosts()
+        except s.SandToolError as exc:
+            assert "hosts" in str(exc).lower() or "DNS" in str(exc)
+        else:
+            raise AssertionError("expected SandToolError")
+    finally:
+        s.install_hosts = orig_install
+        s.hosts_block_installed = orig_present
+
+
+def test_cursor_restarts_after_post_close_failure() -> None:
+    """打补丁会先关 Cursor；后续步骤失败也必须拉起来，否则表现为闪退。"""
+    import sand_patch as s
+
+    calls: list[str] = []
+    layout = object()
+    orig_close = s.close_cursor
+    orig_start = s.start_cursor
+    s.close_cursor = lambda _layout: calls.append("close") or 1  # type: ignore[method-assign]
+    s.start_cursor = lambda _layout: calls.append("start") or True  # type: ignore[method-assign]
+    try:
+        try:
+            s._with_cursor_restarted(layout, lambda: (_ for _ in ()).throw(s.SandToolError("hosts")))
+        except s.SandToolError:
+            pass
+        else:
+            raise AssertionError("expected SandToolError")
+        assert calls == ["close", "start"]
+    finally:
+        s.close_cursor = orig_close
+        s.start_cursor = orig_start
+
+
+def test_cursor_restart_failure_is_reported() -> None:
+    import sand_patch as s
+
+    orig_close = s.close_cursor
+    orig_start = s.start_cursor
+    s.close_cursor = lambda _layout: 1  # type: ignore[method-assign]
+    s.start_cursor = lambda _layout: False  # type: ignore[method-assign]
+    try:
+        try:
+            s._with_cursor_restarted(object(), lambda: None)
+        except s.SandToolError as exc:
+            assert "重新打开" in str(exc)
+        else:
+            raise AssertionError("expected SandToolError")
+    finally:
+        s.close_cursor = orig_close
+        s.start_cursor = orig_start
 
 
 def main() -> int:
@@ -990,6 +1077,10 @@ def main() -> int:
         test_317_local_model_roundtrip,
         test_live_477_memory_roundtrip,
         test_dns_node_roundtrip,
+        test_hosts_permission_does_not_abort_when_block_exists,
+        test_hosts_permission_still_fails_when_block_missing,
+        test_cursor_restarts_after_post_close_failure,
+        test_cursor_restart_failure_is_reported,
     ]
     for test in tests:
         test()

@@ -16,6 +16,10 @@ CURSOR_DNS_HOSTS: Tuple[str, ...] = (
     "api2geo.cursor.sh",
     "api2direct.cursor.sh",
     "cursor.com",
+    # Agent Host 走 api5，不在 api2 上。漏掉会被 Clash fake-ip 劫持，
+    # TLS 握手 ECONNRESET，UI 显示成 "An unexpected error occurred"。
+    "agentn.api5.cursor.sh",
+    "agentn.global.api5.cursor.sh",
 )
 
 HOSTS_BEGIN = "# SAND_CURSOR_DNS_BEGIN"
@@ -85,15 +89,19 @@ def resolve_cursor_api_ip() -> Optional[str]:
 
 
 def build_hosts_entries(tool_version: str) -> List[str]:
-    ip = resolve_cursor_api_ip()
-    if not ip:
-        raise RuntimeError("无法通过 DoH 解析 Cursor API 域名，请检查网络后重试")
     lines = [
         HOSTS_BEGIN,
         f"# sand_patch {tool_version}",
     ]
+    resolved = 0
     for host in CURSOR_DNS_HOSTS:
+        ip = resolve_doh_a(host)
+        if not ip:
+            continue
         lines.append(f"{ip} {host}")
+        resolved += 1
+    if resolved == 0:
+        raise RuntimeError("无法通过 DoH 解析 Cursor API 域名，请检查网络后重试")
     lines.append(HOSTS_END)
     return lines
 
@@ -204,9 +212,11 @@ _DNS_NODE_SNIPPET_RE = re.compile(
 
 
 def apply_dns_node_patch(content: str) -> Tuple[str, int]:
-    if SAND_DNS_FIX_MARKER in content:
+    snippet = dns_node_snippet()
+    if snippet in content:
         return content, 0
-    return dns_node_snippet() + content, 1
+    next_content, _ = remove_dns_node_patch(content)
+    return snippet + next_content, 1
 
 
 def remove_dns_node_patch(content: str) -> Tuple[str, int]:
